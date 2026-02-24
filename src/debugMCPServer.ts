@@ -13,7 +13,7 @@ import {
 } from '.';
 import { logger } from './utils/logger';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 /**
  * Main MCP server class that exposes debugging functionality as tools and resources.
@@ -25,7 +25,7 @@ export class DebugMCPServer {
     private port: number;
     private initialized: boolean = false;
     private debuggingHandler: IDebuggingHandler;
-    private transports: Map<string, SSEServerTransport> = new Map();
+    private transports: Map<string, StreamableHTTPServerTransport> = new Map();
 
     constructor(port: number, timeoutInSeconds: number) {
         // Initialize the debugging components with dependency injection
@@ -57,6 +57,16 @@ export class DebugMCPServer {
      * Setup MCP tools that delegate to the debugging handler
      */
     private setupTools() {
+        // Get debug instructions tool (for clients that don't support MCP resources like GitHub Copilot)
+        this.mcpServer!.registerTool('get_debug_instructions', {
+            description: 'Get the debugging guide with step-by-step instructions for effective debugging. ' +
+                'Returns comprehensive guidance including breakpoint strategies, root cause analysis framework, ' +
+                'and best practices. Call this before starting a debug session.',
+        }, async () => {
+            const content = await this.loadMarkdownFile('agent-resources/debug_instructions.md');
+            return { content: [{ type: 'text' as const, text: content }] };
+        });
+
         // Start debugging tool
         this.mcpServer!.registerTool('start_debugging', {
             description: 'IMPORTANT DEBUGGING TOOL - Start a debug session for a code file' +
@@ -67,13 +77,21 @@ export class DebugMCPServer {
                 '\n• Functions return incorrect results' +
                 '\n• Code behaves differently than expected' +
                 '\n• User reports "it doesn\'t work"' +
-                '\n\n⚠️ CRITICAL: Before using this tool, first read debugmcp://docs/debug_instructions resource!',
+                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read debugmcp://docs/debug_instructions resource!',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the source code file to debug'),
                 workingDirectory: z.string().describe('Working directory for the debug session'),
-                testName: z.string().optional().describe('Name of the specific test name to debug.'),
+                testName: z.string().optional().describe(
+                    'Name of a specific test name to debug. ' +
+                    'Only provide this when debugging a single test method. ' +
+                    'Leave empty to debug the entire file or test class.'
+                ),
+                configurationName: z.string().optional().describe(
+                    'Name of a specific debug configuration from launch.json to use. ' +
+                    'Leave empty to be prompted to select a configuration interactively.'
+                ),
             },
-        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string }) => {
+        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
             const result = await this.debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
@@ -308,29 +326,39 @@ export class DebugMCPServer {
             const express = expressModule.default;
             const app = express();
 
-            // SSE endpoint — clients connect here to establish the MCP session
-            app.get('/sse', async (req: any, res: any) => {
-                logger.info('New SSE connection established');
-                const transport = new SSEServerTransport('/messages', res);
-                this.transports.set(transport.sessionId, transport);
+            // Parse JSON body for incoming requests
+            app.use(express.json());
 
-                transport.onclose = () => {
-                    this.transports.delete(transport.sessionId);
-                    logger.info(`SSE transport closed: ${transport.sessionId}`);
-                };
+            // Streamable HTTP endpoint — handles MCP protocol messages
+            app.post('/mcp', async (req: any, res: any) => {
+                logger.info('New MCP request received');
+                
+                // Create a new transport for each request (stateless mode)
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: undefined, // Stateless mode - no session management
+                });
 
+                // Clean up transport when response closes
+                res.on('close', () => {
+                    transport.close();
+                    logger.info('MCP transport closed');
+                });
+
+                // Connect the MCP server to this transport
                 await this.mcpServer!.connect(transport);
+                
+                // Handle the incoming request
+                await transport.handleRequest(req, res, req.body);
             });
 
-            // Message endpoint — clients POST JSON-RPC messages here
-            app.post('/messages', async (req: any, res: any) => {
-                const sessionId = req.query.sessionId as string;
-                const transport = this.transports.get(sessionId);
-                if (!transport) {
-                    res.status(404).json({ error: 'Session not found' });
-                    return;
-                }
-                await transport.handlePostMessage(req, res);
+            // Legacy SSE endpoint for backward compatibility
+            // Redirects to the new /mcp endpoint with appropriate headers
+            app.get('/sse', async (req: any, res: any) => {
+                res.status(410).json({ 
+                    error: 'SSE endpoint deprecated', 
+                    message: 'Please use POST /mcp endpoint instead',
+                    newEndpoint: '/mcp'
+                });
             });
 
             // Start HTTP server
@@ -353,14 +381,8 @@ export class DebugMCPServer {
      * Stop the MCP server
      */
     async stop() {
-        // Close all active transports
-        for (const [sessionId, transport] of this.transports) {
-            try {
-                await transport.close();
-            } catch (error) {
-                logger.error(`Error closing transport ${sessionId}`, error);
-            }
-        }
+        // Note: With stateless StreamableHTTPServerTransport, transports are closed per-request
+        // No need to track and close them manually
         this.transports.clear();
 
         // Close the HTTP server

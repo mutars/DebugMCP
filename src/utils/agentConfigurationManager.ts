@@ -156,9 +156,79 @@ export class AgentConfigurationManager {
             autoApprove: [],
             disabled: false,
             timeout: this.timeoutInSeconds,
-            type: "sse",
-            url: `http://localhost:${this.serverPort}/sse`
+            type: "streamableHttp",
+            url: `http://localhost:${this.serverPort}/mcp`
         };
+    }
+
+    /**
+     * Migrate existing SSE configurations to streamableHttp
+     * This should be called on extension activation to ensure backward compatibility
+     */
+    public async migrateExistingConfigurations(): Promise<void> {
+        const agents = await this.getSupportedAgents();
+        let migrationCount = 0;
+
+        for (const agent of agents) {
+            try {
+                if (!fs.existsSync(agent.configPath)) {
+                    continue;
+                }
+
+                const configContent = await fs.promises.readFile(agent.configPath, 'utf8');
+                let config: any;
+                
+                try {
+                    config = JSON.parse(configContent);
+                } catch {
+                    continue; // Skip if config can't be parsed
+                }
+
+                const fieldName = agent.mcpServerFieldName;
+                const debugmcpConfig = config[fieldName]?.debugmcp;
+
+                if (!debugmcpConfig) {
+                    continue; // DebugMCP not configured for this agent
+                }
+
+                // Check if it's using the old SSE configuration
+                const needsMigration = 
+                    debugmcpConfig.type === 'sse' || 
+                    debugmcpConfig.type === 'http' ||
+                    (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'));
+
+                if (needsMigration) {
+                    console.log(`Migrating DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
+                    
+                    // Update to new configuration
+                    config[fieldName].debugmcp = this.getDebugMCPConfig();
+                    
+                    // Preserve any custom autoApprove settings
+                    if (debugmcpConfig.autoApprove && Array.isArray(debugmcpConfig.autoApprove)) {
+                        config[fieldName].debugmcp.autoApprove = debugmcpConfig.autoApprove;
+                    }
+                    
+                    // Write the migrated config
+                    await fs.promises.writeFile(
+                        agent.configPath,
+                        JSON.stringify(config, null, 2),
+                        'utf8'
+                    );
+                    
+                    migrationCount++;
+                    console.log(`Successfully migrated ${agent.displayName} configuration`);
+                }
+            } catch (error) {
+                console.error(`Error migrating config for ${agent.name}:`, error);
+                // Continue with other agents even if one fails
+            }
+        }
+
+        if (migrationCount > 0) {
+            vscode.window.showInformationMessage(
+                `DebugMCP: Migrated ${migrationCount} agent configuration(s) to use the new transport protocol.`
+            );
+        }
     }
 
     /**

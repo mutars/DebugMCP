@@ -6,7 +6,7 @@ The MCP server component that exposes VS Code debugging capabilities to AI agent
 
 ## Motivation
 
-AI coding agents need a standardized way to control debuggers programmatically. MCP provides this standard, and `DebugMCPServer` implements it using the official `@modelcontextprotocol/sdk` with Server-Sent Events (SSE) transport over an express HTTP server for real-time bidirectional communication.
+AI coding agents need a standardized way to control debuggers programmatically. MCP provides this standard, and `DebugMCPServer` implements it using the official `@modelcontextprotocol/sdk` with Streamable HTTP transport over an express HTTP server.
 
 ## Responsibility
 
@@ -14,17 +14,17 @@ AI coding agents need a standardized way to control debuggers programmatically. 
 - Register debugging tools that AI agents can invoke
 - Register documentation resources for agent guidance
 - Delegate all debugging operations to `DebuggingHandler`
-- Manage SSE transport connections via `SSEServerTransport` on configurable port (default: 3001)
+- Manage Streamable HTTP transport via `StreamableHTTPServerTransport` on configurable port (default: 3001)
 
 ## Architecture Position
 
 ```
 AI Agent (MCP Client)
         │
-        ▼ SSE Connection (GET /sse + POST /messages)
+        ▼ HTTP POST /mcp
 ┌───────────────────┐
 │  DebugMCPServer   │  ◄── You are here
-│  (express + SSE)  │
+│ (express + HTTP)  │
 └───────────────────┘
         │
         ▼ Delegates to
@@ -38,15 +38,14 @@ AI Agent (MCP Client)
 ### Tools vs Resources
 
 - **Tools**: Actions the AI can perform (start debugging, step over, etc.)
-- **Resources**: Documentation the AI can read for guidance
+- **Resources**: Documentation the AI can read for guidance (note: some clients like GitHub Copilot don't support resources, so the `get_debug_instructions` tool is also provided)
 
-### SSE Transport
+### Streamable HTTP Transport
 
-Uses HTTP with Server-Sent Events for persistent connections. The express server exposes two endpoints:
-- `GET /sse` — Establishes the SSE stream and creates a session
-- `POST /messages?sessionId=...` — Receives JSON-RPC messages from the client
+Uses stateless HTTP POST requests for MCP communication. The express server exposes:
+- `POST /mcp` — Handles all MCP protocol messages (JSON-RPC over HTTP)
 
-Each client connection creates an `SSEServerTransport` instance that is connected to the `McpServer`. The server tracks active transports by session ID and cleans them up on disconnect.
+Each request creates a new `StreamableHTTPServerTransport` instance in stateless mode, which is cleaned up when the response closes. This approach is simpler than session-based transports and works well with standard HTTP clients.
 
 ## Key Code Locations
 
@@ -59,6 +58,7 @@ Each client connection creates an `SSEServerTransport` instance that is connecte
 
 | Tool | Description |
 |------|-------------|
+| `get_debug_instructions` | Get debugging guide (for clients that don't support resources) |
 | `start_debugging` | Start a debug session |
 | `stop_debugging` | Stop current session |
 | `step_over/into/out` | Stepping commands |

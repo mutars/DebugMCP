@@ -24,6 +24,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // Initialize Agent Configuration Manager
     agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort);
 
+    // Migrate existing SSE configurations to streamableHttp (for backward compatibility)
+    try {
+        await agentConfigManager.migrateExistingConfigurations();
+    } catch (error) {
+        logger.error('Error migrating existing configurations', error);
+    }
+
     // Initialize MCP Server
     try {
         logger.info('Starting MCP server initialization...');

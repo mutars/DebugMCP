@@ -10,7 +10,7 @@ import { logger } from './utils/logger';
  * Interface for debugging handler operations
  */
 export interface IDebuggingHandler {
-    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string }): Promise<string>;
+    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
     handleStopDebugging(): Promise<string>;
     handleStepOver(): Promise<string>;
     handleStepInto(): Promise<string>;
@@ -48,11 +48,12 @@ export class DebuggingHandler implements IDebuggingHandler {
         fileFullPath: string; 
         workingDirectory: string;
         testName?: string;
+        configurationName?: string;
     }): Promise<string> {
-        const { fileFullPath, workingDirectory, testName } = args;
+        const { fileFullPath, workingDirectory, testName, configurationName } = args;
         
         try {            
-            let selectedConfigName = await this.configManager.promptForConfiguration(workingDirectory);
+            let selectedConfigName = configurationName ?? await this.configManager.promptForConfiguration(workingDirectory);
             
             // Get debug configuration from launch.json or create default
             const debugConfig = await this.configManager.getDebugConfig(
@@ -75,7 +76,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 const configInfo = selectedConfigName ? ` using configuration '${selectedConfigName}'` : ' with default configuration';
                 const testInfo = testName ? ` (test: ${testName})` : '';
                 const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                return `Debug session started successfully for: ${fileFullPath}${configInfo}${testInfo}. Current state: ${this.formatDebugState(currentState)}`;
+                return `Debug session started successfully for: ${fileFullPath}${configInfo}${testInfo}. Current state: ${currentState.toString()}`;
             } else {
                 throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
             }
@@ -137,8 +138,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
 
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step over: ${error}`);
         }
@@ -161,8 +161,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step into: ${error}`);
         }
@@ -185,8 +184,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step out: ${error}`);
         }
@@ -209,10 +207,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            let result = this.formatDebugState(afterState);
-
-            
-            return result;
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing continue: ${error}`);
         }
@@ -421,41 +416,6 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
     }
 
-    /**
-     * Format debug state as a readable string
-     */
-    private formatDebugState(state: DebugState): string {
-        if (!state.sessionActive) {
-            return 'Debug session is not active';
-        }
-
-        let output = 'Debug State:\n==========\n\n';
-        
-        if (state.hasFrameName()) {
-            output += `Frame: ${state.frameName}\n`;
-        }
-        
-        if (state.hasLocationInfo()) {
-            output += `File: ${state.fileName}\n`;
-            output += `Line: ${state.currentLine}\n`;        
-            
-            output += `${state.currentLine}: ${state.currentLineContent}\n`;
-            
-            // Show next few lines for context
-            // if (state.nextLines && state.nextLines.length > 0) {
-            //     output += '\nNext lines:\n';
-            //     state.nextLines.forEach((line, index) => {
-            //         const lineNumber = (state.currentLine || 0) + index + 1;
-            //         output += `   ${lineNumber}: ${line}\n`;
-            //     });
-            // }
-        } else {
-            output += 'No location information available. The session might have stopped or ended\n';
-        }
-                
-        return output;
-    }
-    
     /**
      * Get current debug state
      */
