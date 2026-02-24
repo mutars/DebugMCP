@@ -24,7 +24,8 @@ export class DebugState {
     public threadId: number | null;
     public frameName: string | null;
     public stackTrace: StackFrame[];
-    // TODO breakpoints
+    public configurationName: string | null;
+    public breakpoints: string[];
     
     constructor() {
         this.sessionActive = false;
@@ -37,6 +38,8 @@ export class DebugState {
         this.threadId = null;
         this.frameName = null;
         this.stackTrace = [];
+        this.configurationName = null;
+        this.breakpoints = [];
     }
 
     /**
@@ -53,6 +56,8 @@ export class DebugState {
         this.threadId = null;
         this.frameName = null;
         this.stackTrace = [];
+        this.configurationName = null;
+        this.breakpoints = [];
     }
 
     /**
@@ -119,8 +124,19 @@ export class DebugState {
     }
 
     /**
-     * Clone the current state
+     * Update the configuration name
      */
+    public updateConfigurationName(configurationName: string | null): void {
+        this.configurationName = configurationName;
+    }
+
+    /**
+     * Update breakpoints list (formatted as "fileName:line" strings)
+     */
+    public updateBreakpoints(breakpoints: string[]): void {
+        this.breakpoints = [...breakpoints];
+    }
+
     public clone(): DebugState {
         const cloned = new DebugState();
         cloned.sessionActive = this.sessionActive;
@@ -133,6 +149,52 @@ export class DebugState {
         cloned.threadId = this.threadId;
         cloned.frameName = this.frameName;
         cloned.stackTrace = [...this.stackTrace];
+        cloned.configurationName = this.configurationName;
+        cloned.breakpoints = [...this.breakpoints];
         return cloned;
+    }
+
+    /**
+     * Format debug state as a JSON string for structured output
+     */
+    public toString(): string {
+        const stateObject: {
+            sessionActive: boolean;
+            configurationName?: string | null;
+            stackTrace?: string[];
+            breakpoints?: string[];
+            fileFullPath?: string | null;
+            fileName?: string | null;
+            currentLine?: number | null;
+            currentLineContent?: string | null;
+            nextLines?: string[];
+            frameId?: number | null;
+            threadId?: number | null;
+            frameName?: string | null;
+        } = {
+            sessionActive: this.sessionActive,
+        };
+
+        if (this.sessionActive) {
+            stateObject.configurationName = this.configurationName;
+
+            // Compact stack trace: "functionName:line" format
+            stateObject.stackTrace = this.stackTrace.map(frame => 
+                `${frame.name}:${frame.line || '?'}`
+            );
+
+            stateObject.breakpoints = this.breakpoints;
+
+            stateObject.fileFullPath = this.fileFullPath;
+            stateObject.fileName = this.fileName;
+            stateObject.currentLine = this.currentLine;
+            stateObject.currentLineContent = this.currentLineContent;
+            stateObject.nextLines = this.nextLines;
+            stateObject.frameId = this.frameId;
+            stateObject.threadId = this.threadId;
+            stateObject.frameName = this.frameName;
+        }
+
+        return JSON.stringify(stateObject, null, 2);
     }
 }

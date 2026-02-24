@@ -10,7 +10,7 @@ import { logger } from './utils/logger';
  * Interface for debugging handler operations
  */
 export interface IDebuggingHandler {
-    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string }): Promise<string>;
+    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
     handleStopDebugging(): Promise<string>;
     handleStepOver(): Promise<string>;
     handleStepInto(): Promise<string>;
@@ -48,11 +48,12 @@ export class DebuggingHandler implements IDebuggingHandler {
         fileFullPath: string; 
         workingDirectory: string;
         testName?: string;
+        configurationName?: string;
     }): Promise<string> {
-        const { fileFullPath, workingDirectory, testName } = args;
+        const { fileFullPath, workingDirectory, testName, configurationName } = args;
         
         try {            
-            let selectedConfigName = await this.configManager.promptForConfiguration(workingDirectory);
+            let selectedConfigName = configurationName ?? await this.configManager.promptForConfiguration(workingDirectory);
             
             // Get debug configuration from launch.json or create default
             const debugConfig = await this.configManager.getDebugConfig(
@@ -75,7 +76,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 const configInfo = selectedConfigName ? ` using configuration '${selectedConfigName}'` : ' with default configuration';
                 const testInfo = testName ? ` (test: ${testName})` : '';
                 const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                return `Debug session started successfully for: ${fileFullPath}${configInfo}${testInfo}. Current state: ${this.formatDebugState(currentState)}`;
+                return `Debug session started successfully for: ${fileFullPath}${configInfo}${testInfo}. Current state: ${currentState.toString()}`;
             } else {
                 throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
             }
@@ -137,8 +138,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
 
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step over: ${error}`);
         }
@@ -161,8 +161,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step into: ${error}`);
         }
@@ -185,8 +184,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            // Format the debug state as a string
-            return this.formatDebugState(afterState);
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing step out: ${error}`);
         }
@@ -209,10 +207,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             // Wait for debugger state to change
             const afterState = await this.waitForStateChange(beforeState);
             
-            let result = this.formatDebugState(afterState);
-
-            
-            return result;
+            return afterState.toString();
         } catch (error) {
             throw new Error(`Error executing continue: ${error}`);
         }
@@ -421,55 +416,6 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
     }
 
-    /**
-     * Format debug state as a JSON string for structured output
-     */
-    private formatDebugState(state: DebugState): string {
-        const stateObject: {
-            sessionActive: boolean;
-            stackTrace?: string[];
-            breakpoints?: string[];
-            fileFullPath?: string | null;
-            fileName?: string | null;
-            currentLine?: number | null;
-            currentLineContent?: string | null;
-            nextLines?: string[];
-            frameId?: number | null;
-            threadId?: number | null;
-            frameName?: string | null;
-        } = {
-            sessionActive: state.sessionActive,
-        };
-
-        if (state.sessionActive) {
-            // Compact stack trace: "functionName:line" format
-            stateObject.stackTrace = state.stackTrace.map(frame => 
-                `${frame.name}:${frame.line || '?'}`
-            );
-            
-            // Compact breakpoints list: "fileName:line" format
-            const breakpoints = this.executor.getBreakpoints();
-            stateObject.breakpoints = breakpoints
-                .filter((bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint)
-                .map(bp => {
-                    const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop() || 'unknown';
-                    const line = bp.location.range.start.line + 1;
-                    return `${fileName}:${line}`;
-                });
-            
-            stateObject.fileFullPath = state.fileFullPath;
-            stateObject.fileName = state.fileName;
-            stateObject.currentLine = state.currentLine;
-            stateObject.currentLineContent = state.currentLineContent;
-            stateObject.nextLines = state.nextLines;
-            stateObject.frameId = state.frameId;
-            stateObject.threadId = state.threadId;
-            stateObject.frameName = state.frameName;
-        }
-
-        return JSON.stringify(stateObject, null, 2);
-    }
-    
     /**
      * Get current debug state
      */

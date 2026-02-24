@@ -35,7 +35,7 @@ DebugMCP bridges the gap between professional debugging and AI-assisted developm
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | **get_debug_instructions** | Get the debugging guide with best practices and workflow instructions | None |
-| **start_debugging** | Start a debug session for a source code file | `fileFullPath` (required)<br>`workingDirectory` (required)<br>`testName` (optional) |
+| **start_debugging** | Start a debug session for a source code file | `fileFullPath` (required)<br>`workingDirectory` (required)<br>`testName` (optional)<br>`configurationName` (optional) |
 | **stop_debugging** | Stop the current debug session | None |
 | **step_over** | Execute the next line (step over function calls) | None |
 | **step_into** | Step into function calls | None |

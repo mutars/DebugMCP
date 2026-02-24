@@ -86,8 +86,12 @@ export class DebugMCPServer {
                     'Only provide this when debugging a single test method. ' +
                     'Leave empty to debug the entire file or test class.'
                 ),
+                configurationName: z.string().optional().describe(
+                    'Name of a specific debug configuration from launch.json to use. ' +
+                    'Leave empty to be prompted to select a configuration interactively.'
+                ),
             },
-        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string }) => {
+        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
             const result = await this.debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });

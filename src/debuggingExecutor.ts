@@ -166,6 +166,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             const activeSession = vscode.debug.activeDebugSession;
             if (activeSession) {
                 state.sessionActive = true;
+                state.updateConfigurationName(activeSession.configuration.name ?? null);
                 
                 const activeStackItem = vscode.debug.activeStackItem;
                 if (activeStackItem && 'frameId' in activeStackItem) {
@@ -207,6 +208,17 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             console.log('Unable to get debug state:', error);
         }
         
+        // Populate breakpoints as compact "fileName:line" strings
+        const breakpoints = vscode.debug.breakpoints;
+        const formattedBreakpoints = breakpoints
+            .filter((bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint)
+            .map(bp => {
+                const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop() || 'unknown';
+                const line = bp.location.range.start.line + 1;
+                return `${fileName}:${line}`;
+            });
+        state.updateBreakpoints(formattedBreakpoints);
+
         return state;
     }
 
