@@ -421,8 +421,3 @@ FodyWeavers.xsd
 node_modules/*
 out/*
 .vscode-test/*
-
-# Remotion ad project (moved to separate directory)
-debugmcp-ad/
-.agents/
-skills-lock.json
