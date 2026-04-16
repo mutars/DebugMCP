@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as http from 'http';
 import {
     DebuggingExecutor,
-    ConfigurationManager,
     DebuggingHandler,
     IDebuggingHandler
 } from '.';
@@ -48,8 +47,7 @@ export class DebugMCPServer {
     constructor(port: number, timeoutInSeconds: number) {
         // Initialize the debugging components with dependency injection
         const executor = new DebuggingExecutor();
-        const configManager = new ConfigurationManager();
-        this.debuggingHandler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
+        this.debuggingHandler = new DebuggingHandler(executor, timeoutInSeconds);
         this.port = port;
     }
 
@@ -87,29 +85,54 @@ export class DebugMCPServer {
 
         // Start debugging tool
         this.mcpServer!.registerTool('start_debugging', {
-            description: 'IMPORTANT DEBUGGING TOOL - Start a debug session for a code file' +
-                '\n\nUSE THIS WHEN:' +
-                '\n• Any bug, error, or unexpected behavior occurs' +
-                '\n• Asked to debug a unit test' +
-                '\n• Variables have wrong/null values' +
-                '\n• Functions return incorrect results' +
-                '\n• Code behaves differently than expected' +
-                '\n• User reports "it doesn\'t work"' +
-                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read debugmcp://docs/debug_instructions resource!',
+            description:
+                'IMPORTANT DEBUGGING TOOL - Launch a C++ binary under the cppvsdbg debugger.\n\n' +
+                'USE THIS WHEN:\n' +
+                '• You need to launch a Windows C++ executable for debugging\n' +
+                '• Any bug, error, or unexpected behavior occurs in a C++ program\n\n' +
+                'The tool builds a launch configuration from the fields below. No launch.json ' +
+                'is read or written. `type` is always "cppvsdbg" and `request` is always "launch".\n\n' +
+                '⚠️ Before first use in a project, read resource debugmcp://docs/debug_instructions.',
             inputSchema: {
-                fileFullPath: z.string().describe('Full path to the source code file to debug'),
-                workingDirectory: z.string().describe('Working directory for the debug session'),
-                testName: z.string().optional().describe(
-                    'Name of a specific test name to debug. ' +
-                    'Only provide this when debugging a single test method. ' +
-                    'Leave empty to debug the entire file or test class.'
+                program: z.string().describe(
+                    "Absolute path to the .exe to launch, or a path using ${workspaceFolder}. " +
+                    "Examples: 'C:/repo/build/app.exe', '${workspaceFolder}/bin/x64/app_d.exe'. Required."
                 ),
-                configurationName: z.string().optional().describe(
-                    'Name of a specific debug configuration from launch.json to use. ' +
-                    'Leave empty to be prompted to select a configuration interactively.'
+                args: z.array(z.string()).optional().describe(
+                    "Arguments passed to the program. Each element is one argv token (no shell splitting). " +
+                    "Defaults to []."
+                ),
+                cwd: z.string().optional().describe(
+                    "Working directory for the program. Supports ${workspaceFolder}. " +
+                    "Defaults to the workspace root."
+                ),
+                environment: z.array(z.object({
+                    name: z.string(),
+                    value: z.string(),
+                })).optional().describe(
+                    "Environment variables as {name, value} pairs. Values support ${workspaceFolder} " +
+                    "and ${env:VAR}. Defaults to []."
+                ),
+                console: z.enum([
+                    "integratedTerminal", "internalConsole", "externalTerminal", "newExternalWindow",
+                ]).optional().describe(
+                    "Where the program's stdout/stdin go. Defaults to 'integratedTerminal'."
+                ),
+                stopAtEntry: z.boolean().optional().describe(
+                    "If true, break on program entry (main). Defaults to false."
+                ),
+                extraConfig: z.record(z.unknown()).optional().describe(
+                    "Escape hatch: additional cppvsdbg fields merged into the final DebugConfiguration. " +
+                    "Use for rarely-needed fields like sourceFileMap, symbolSearchPath, visualizerFile, " +
+                    "enableDebugHeap, logging. Values here override defaults but NOT the explicit fields " +
+                    "above. Hardcoded type/request/name cannot be overridden."
+                ),
+                waitForBreakpointSeconds: z.number().int().positive().optional().describe(
+                    "How long to wait for a breakpoint (or entry) to be hit before returning the " +
+                    "'attached-but-running' success result. Defaults to 30."
                 ),
             },
-        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
+        }, async (args) => {
             const result = await this.debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });

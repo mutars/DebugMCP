@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
-import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
+import { buildCppvsdbgConfig, StartDebuggingArgs } from './utils/cppvsdbgConfig';
 
 /**
  * Interface for debugging handler operations
  */
 export interface IDebuggingHandler {
-    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
+    handleStartDebugging(args: StartDebuggingArgs): Promise<string>;
     handleStopDebugging(): Promise<string>;
     handleStepOver(): Promise<string>;
     handleStepInto(): Promise<string>;
@@ -32,56 +32,58 @@ export class DebuggingHandler implements IDebuggingHandler {
     private readonly numNextLines: number = 3;
     private readonly executionDelay: number = 300; // ms to wait for debugger updates
     private readonly timeoutInSeconds: number;
+    private static readonly DEFAULT_ATTACH_TIMEOUT_SECONDS = 30;
 
     constructor(
         private readonly executor: IDebuggingExecutor,
-        private readonly configManager: IDebugConfigurationManager,
-        timeoutInSeconds: number
+        timeoutInSeconds: number,
     ) {
         this.timeoutInSeconds = timeoutInSeconds;
     }
 
     /**
-     * Start a debugging session
+     * Start a debugging session. Builds a cppvsdbg launch configuration from
+     * `args` and resolves with one of three outcomes:
+     *   - paused:         debugger stopped at a location
+     *   - attached:       session attached but no breakpoint hit within timeout
+     *   - never-attached: session never appeared → throws
      */
-    public async handleStartDebugging(args: { 
-        fileFullPath: string; 
-        workingDirectory: string;
-        testName?: string;
-        configurationName?: string;
-    }): Promise<string> {
-        const { fileFullPath, workingDirectory, testName, configurationName } = args;
-        
-        try {            
-            let selectedConfigName = configurationName ?? await this.configManager.promptForConfiguration(workingDirectory);
-            
-            // Get debug configuration from launch.json or create default
-            const debugConfig = await this.configManager.getDebugConfig(
-                workingDirectory, 
-                fileFullPath, 
-                selectedConfigName,
-                testName
-            );
+    public async handleStartDebugging(args: StartDebuggingArgs): Promise<string> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            throw new Error('No workspace folder open in VS Code');
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-            const started = await this.executor.startDebugging(workingDirectory, debugConfig);
-            if (started) {
-                // Wait for debug session to become active using exponential backoff
-                const sessionActive = await this.waitForActiveDebugSession();
-                
-                if (!sessionActive) {
-                    throw new Error('Debug session started but failed to become active within timeout period');
-                }
-                
-                // return also the current state
-                const configInfo = selectedConfigName ? ` using configuration '${selectedConfigName}'` : ' with default configuration';
-                const testInfo = testName ? ` (test: ${testName})` : '';
+        const config = buildCppvsdbgConfig(args, workspaceRoot);
+        const timeoutMs =
+            (args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS) * 1000;
+
+        const started = await this.executor.startDebugging(workspaceRoot, config);
+        if (!started) {
+            throw new Error('vscode.debug.startDebugging returned false');
+        }
+
+        const outcome = await this.waitForSessionOutcome(timeoutMs);
+        const seconds = Math.round(timeoutMs / 1000);
+
+        switch (outcome) {
+            case 'paused': {
                 const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                return `Debug session started successfully for: ${fileFullPath}${configInfo}${testInfo}. Current state: ${currentState.toString()}`;
-            } else {
-                throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
+                return `Debug session started. Paused at ${currentState.toString()}`;
             }
-        } catch (error) {
-            throw new Error(`Error starting debug session: ${error}`);
+            case 'attached': {
+                const bps = this.formatBreakpoints();
+                return (
+                    `Debug session started and attached, but no breakpoint hit within ${seconds}s.\n` +
+                    `The program is running. Active breakpoints:\n${bps}`
+                );
+            }
+            case 'never-attached':
+                throw new Error(
+                    `Debug session failed to attach within ${seconds}s ` +
+                    `(vscode.debug.activeDebugSession never appeared)`,
+                );
         }
     }
 
@@ -431,32 +433,48 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
-     * Wait for debug session to become active using exponential backoff starting from 1 second
+     * Wait up to timeoutMs for the session to reach a paused state.
+     * Returns:
+     *   - "paused"         : debugger is stopped with location info
+     *   - "attached"       : session object exists but never paused within timeout
+     *   - "never-attached" : no session object ever appeared
      */
-    private async waitForActiveDebugSession(): Promise<boolean> {
-        const baseDelay = 1000; // Start with 1 second
-        const maxDelay = 10000; // Cap at 10 seconds
-        
+    private async waitForSessionOutcome(
+        timeoutMs: number,
+    ): Promise<'paused' | 'attached' | 'never-attached'> {
+        const baseDelay = 1000;
+        const maxDelay = 10000;
         const startTime = Date.now();
         let attempt = 0;
-        
-        while (Date.now() - startTime < this.timeoutInSeconds * 1000) {
-            if (await this.executor.hasActiveSession()) {
-                logger.info('Debug session is now active!');
-                return true;
-            }
-            
-            logger.info(`[Attempt ${attempt + 1}] Waiting for debug session to become active...`);
 
-            // Calculate delay using exponential backoff with jitter
+        while (Date.now() - startTime < timeoutMs) {
+            if (await this.executor.hasActiveSession()) {
+                logger.info('Debug session reached paused state.');
+                return 'paused';
+            }
             const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
-            const jitteredDelay = delay + Math.random() * 200; // Add up to 200ms jitter
-            
-            await new Promise(resolve => setTimeout(resolve, jitteredDelay));
+            const jitteredDelay = delay + Math.random() * 200;
+            await new Promise((resolve) => setTimeout(resolve, jitteredDelay));
             attempt++;
         }
-        
-        return false; // Timeout reached
+
+        return this.executor.hasAttachedSession() ? 'attached' : 'never-attached';
+    }
+
+    /**
+     * Render vscode.debug.breakpoints (source breakpoints only) as a bulleted
+     * list of "<fsPath>:<line>" entries. Returns a placeholder if there are none.
+     */
+    private formatBreakpoints(): string {
+        const sourceBps = vscode.debug.breakpoints.filter(
+            (bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint,
+        );
+        if (sourceBps.length === 0) {
+            return '  (No breakpoints set)';
+        }
+        return sourceBps
+            .map((bp) => `  - ${bp.location.uri.fsPath}:${bp.location.range.start.line + 1}`)
+            .join('\n');
     }
 
     /**

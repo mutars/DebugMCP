@@ -22,6 +22,7 @@ export interface IDebuggingExecutor {
     getBreakpoints(): readonly vscode.Breakpoint[];
     clearAllBreakpoints(): void;
     hasActiveSession(): Promise<boolean>;
+    hasAttachedSession(): boolean;
     getActiveSession(): vscode.DebugSession | undefined;
 }
 
@@ -362,6 +363,15 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             console.log('Session readiness check failed:', error);
             return false;
         }
+    }
+
+    /**
+     * Returns true iff VS Code has an active debug session object,
+     * regardless of whether it is paused at a location.
+     * Used to distinguish "launched but running" from "launch failed".
+     */
+    public hasAttachedSession(): boolean {
+        return !!vscode.debug.activeDebugSession;
     }
 
     /**

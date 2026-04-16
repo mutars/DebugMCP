@@ -10,7 +10,7 @@ import { DebuggingHandler } from '../debuggingHandler';
 suite('DebuggingHandler State Change Detection', () => {
     
     test('hasStateChanged should detect line number changes', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
@@ -28,7 +28,7 @@ suite('DebuggingHandler State Change Detection', () => {
     });
     
     test('hasStateChanged should detect file changes', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
@@ -44,7 +44,7 @@ suite('DebuggingHandler State Change Detection', () => {
     });
     
     test('hasStateChanged should detect session status changes', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
@@ -59,7 +59,7 @@ suite('DebuggingHandler State Change Detection', () => {
     });
     
     test('hasStateChanged should detect frame name changes', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
@@ -75,7 +75,7 @@ suite('DebuggingHandler State Change Detection', () => {
     });
     
     test('hasStateChanged should return false for identical states', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
@@ -91,7 +91,7 @@ suite('DebuggingHandler State Change Detection', () => {
     });
     
     test('hasStateChanged should handle states without location info', () => {
-        const handler = new DebuggingHandler({} as any, {} as any, 30);
+        const handler = new DebuggingHandler({} as any, 30);
         
         const beforeState = new DebugState();
         beforeState.sessionActive = true;
