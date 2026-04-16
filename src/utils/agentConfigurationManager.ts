@@ -38,6 +38,10 @@ export class AgentConfigurationManager {
      * Check if we should show the post-install popup
      */
     public async shouldShowPopup(): Promise<boolean> {
+        // Headless mode (embedded/automated usage) always suppresses the popup
+        const headless = vscode.workspace.getConfiguration('debugmcp').get<boolean>('headless', false);
+        if (headless) return false;
+
         // Check if popup has already been shown
         const popupShown = this.context.globalState.get<boolean>(this.POPUP_SHOWN_KEY, false);
         return !popupShown;

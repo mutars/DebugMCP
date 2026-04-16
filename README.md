@@ -190,6 +190,51 @@ Configure DebugMCP behavior in VSCode settings:
 |---------|---------|-------------|
 | `debugmcp.serverPort` | `3001` | Port number for the MCP server |
 | `debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
+| `debugmcp.headless` | `false` | When `true`, suppress popup/toast/migration. Intended for automated wrappers. |
+
+
+## Headless / embedded usage
+
+DebugMCP can be embedded inside an automated wrapper (e.g., a headless VS Code Server started by a CI job or a stdio MCP proxy). In that mode the interactive VS Code UX is unwanted.
+
+Two contracts are exposed for embedders:
+
+### `DEBUGMCP_PORT` environment variable
+
+If set and parseable as a finite number, this overrides the `debugmcp.serverPort` setting. Intended for wrappers that allocate a free port and pass it into the VS Code server process:
+
+```js
+spawn(node, [serverMain, "--server-data-dir", dir, "--port", String(vscodePort)], {
+  env: { ...process.env, DEBUGMCP_PORT: String(debugMcpPort) },
+});
+```
+
+The extension host inherits the environment from the VS Code server process.
+
+### `debugmcp.headless` setting
+
+Boolean, default `false`. When `true`:
+
+- The post-install agent-selection popup is suppressed.
+- The success toast (`DebugMCP server running on ...`) is suppressed.
+- The error toast on MCP server init failure is suppressed (errors still go to the output channel).
+- The SSE → streamableHttp config migration step is skipped.
+
+Set it via `Machine/settings.json` in the VS Code server data dir:
+
+```json
+{ "debugmcp.headless": true }
+```
+
+### Bind-failure stderr token
+
+If DebugMCP's HTTP server fails to bind with `EADDRINUSE`, it writes a distinctive line to stderr:
+
+```
+DEBUGMCP_BIND_FAILED port=<number>
+```
+
+Wrappers can scrape VS Code server stderr for this token to fail fast instead of waiting for a readiness timeout.
 
 
 ## FAQ

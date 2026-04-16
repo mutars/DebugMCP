@@ -16,6 +16,24 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 /**
+ * Distinctive stderr token emitted when the HTTP server fails to bind with EADDRINUSE.
+ * Headless wrappers can scrape VS Code server stderr for this to fail fast instead of
+ * waiting for a full readiness timeout.
+ *
+ * The `log` parameter is injectable for testing (extension-host environments shadow
+ * global console); production callers pass no argument and get the default stderr path.
+ */
+export function logBindFailure(
+    port: number,
+    err: NodeJS.ErrnoException,
+    log: (msg: string) => void = (msg) => process.stderr.write(msg + '\n')
+): void {
+    if (err.code === 'EADDRINUSE') {
+        log(`DEBUGMCP_BIND_FAILED port=${port}`);
+    }
+}
+
+/**
  * Main MCP server class that exposes debugging functionality as tools and resources.
  * Uses the official @modelcontextprotocol/sdk with SSE transport over express.
  */
@@ -366,7 +384,10 @@ export class DebugMCPServer {
                 this.httpServer = app.listen(this.port, () => {
                     resolve();
                 });
-                this.httpServer.on('error', reject);
+                this.httpServer.on('error', (err: NodeJS.ErrnoException) => {
+                    logBindFailure(this.port, err);
+                    reject(err);
+                });
             });
 
             logger.info(`DebugMCP server started successfully on port ${this.port}`);

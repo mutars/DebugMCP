@@ -76,6 +76,11 @@
           "type": "number",
           "default": 3001,
           "description": "Port number for the DebugMCP server"
+        },
+        "debugmcp.headless": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, suppress interactive UX (agent-selection popup, info/error toasts, SSE\u2192streamableHttp migration prompt). Intended for headless/embedded use where the extension is driven by an automated wrapper."
         }
       }
     }
