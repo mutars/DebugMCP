@@ -26,23 +26,25 @@ export class AgentConfigurationManager {
     private readonly POPUP_SHOWN_KEY = 'debugmcp.popupShown';
     private readonly timeoutInSeconds: number;
     private readonly serverPort: number;
-    
+    private readonly headless: boolean;
 
-    constructor(context: vscode.ExtensionContext, timeoutInSeconds: number, serverPort: number) {
+    constructor(
+        context: vscode.ExtensionContext,
+        timeoutInSeconds: number,
+        serverPort: number,
+        headless: boolean = false,
+    ) {
         this.context = context;
         this.timeoutInSeconds = timeoutInSeconds;
         this.serverPort = serverPort;
+        this.headless = headless;
     }
 
     /**
      * Check if we should show the post-install popup
      */
     public async shouldShowPopup(): Promise<boolean> {
-        // Headless mode (embedded/automated usage) always suppresses the popup
-        const headless = vscode.workspace.getConfiguration('debugmcp').get<boolean>('headless', false);
-        if (headless) return false;
-
-        // Check if popup has already been shown
+        if (this.headless) return false;
         const popupShown = this.context.globalState.get<boolean>(this.POPUP_SHOWN_KEY, false);
         return !popupShown;
     }

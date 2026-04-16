@@ -154,47 +154,28 @@ export class DebugState {
         return cloned;
     }
 
-    /**
-     * Format debug state as a JSON string for structured output
-     */
-    public toString(): string {
-        const stateObject: {
-            sessionActive: boolean;
-            configurationName?: string | null;
-            stackTrace?: string[];
-            breakpoints?: string[];
-            fileFullPath?: string | null;
-            fileName?: string | null;
-            currentLine?: number | null;
-            currentLineContent?: string | null;
-            nextLines?: string[];
-            frameId?: number | null;
-            threadId?: number | null;
-            frameName?: string | null;
-        } = {
+    public toJSON(): Record<string, unknown> {
+        const paused = this.sessionActive && this.hasLocationInfo();
+        const base: Record<string, unknown> = {
             sessionActive: this.sessionActive,
+            paused,
         };
+        if (!paused) return base;
+        base.configurationName = this.configurationName;
+        base.stackTrace = this.stackTrace.map((f) => `${f.name}:${f.line ?? '?'}`);
+        base.breakpoints = this.breakpoints;
+        base.fileFullPath = this.fileFullPath;
+        base.fileName = this.fileName;
+        base.currentLine = this.currentLine;
+        base.currentLineContent = this.currentLineContent;
+        base.nextLines = this.nextLines;
+        base.frameId = this.frameId;
+        base.threadId = this.threadId;
+        base.frameName = this.frameName;
+        return base;
+    }
 
-        if (this.sessionActive) {
-            stateObject.configurationName = this.configurationName;
-
-            // Compact stack trace: "functionName:line" format
-            stateObject.stackTrace = this.stackTrace.map(frame => 
-                `${frame.name}:${frame.line || '?'}`
-            );
-
-            stateObject.breakpoints = this.breakpoints;
-
-            stateObject.fileFullPath = this.fileFullPath;
-            stateObject.fileName = this.fileName;
-            stateObject.currentLine = this.currentLine;
-            stateObject.currentLineContent = this.currentLineContent;
-            stateObject.nextLines = this.nextLines;
-            stateObject.frameId = this.frameId;
-            stateObject.threadId = this.threadId;
-            stateObject.frameName = this.frameName;
-        }
-
-        return JSON.stringify(stateObject, null, 2);
+    public toString(): string {
+        return JSON.stringify(this.toJSON(), null, 2);
     }
 }

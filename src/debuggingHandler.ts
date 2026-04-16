@@ -1,36 +1,59 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { buildCppvsdbgConfig, StartDebuggingArgs } from './utils/cppvsdbgConfig';
+import { classifySessionState, gateErrorFor } from './utils/sessionGate';
 
-/**
- * Interface for debugging handler operations
- */
-export interface IDebuggingHandler {
-    handleStartDebugging(args: StartDebuggingArgs): Promise<string>;
-    handleStopDebugging(): Promise<string>;
-    handleStepOver(): Promise<string>;
-    handleStepInto(): Promise<string>;
-    handleStepOut(): Promise<string>;
-    handleContinue(): Promise<string>;
-    handleRestart(): Promise<string>;
-    handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string>;
-    handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
-    handleClearAllBreakpoints(): Promise<string>;
-    handleListBreakpoints(): Promise<string>;
-    handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<string>;
-    handleEvaluateExpression(args: { expression: string }): Promise<string>;
+export interface HandlerResponse<T = unknown> {
+    text: string;
+    structuredContent: T;
+    isError?: boolean;
 }
 
-/**
- * Handles debugging operations using the executor and configuration manager
- */
+export type BreakpointErrorReason = 'bad_input' | 'no_match' | 'multi_match';
+
+export interface AddBreakpointArgs {
+    fileFullPath: string;
+    line?: number;
+    lineContent?: string;
+    condition?: string;
+    hitCondition?: string;
+    logMessage?: string;
+    allowMultiple?: boolean;
+}
+
+export interface RemoveBreakpointArgs {
+    fileFullPath: string;
+    line?: number;
+    lineContent?: string;
+}
+
+export interface IDebuggingHandler {
+    handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse>;
+    handleStopDebugging(): Promise<HandlerResponse>;
+    handleStepOver(args?: { steps?: number }): Promise<HandlerResponse>;
+    handleStepInto(): Promise<HandlerResponse>;
+    handleStepOut(): Promise<HandlerResponse>;
+    handleContinue(): Promise<HandlerResponse>;
+    handleRestart(): Promise<HandlerResponse>;
+    handleAddBreakpoint(args: AddBreakpointArgs): Promise<HandlerResponse>;
+    handleRemoveBreakpoint(args: RemoveBreakpointArgs): Promise<HandlerResponse>;
+    handleClearAllBreakpoints(): Promise<HandlerResponse>;
+    handleListBreakpoints(): Promise<HandlerResponse>;
+    handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse>;
+    handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse>;
+    handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse>;
+    handleGetCurrentLocation(): Promise<HandlerResponse>;
+    handleGetStackTrace(): Promise<HandlerResponse>;
+}
+
 export class DebuggingHandler implements IDebuggingHandler {
     private readonly numNextLines: number = 3;
-    private readonly executionDelay: number = 300; // ms to wait for debugger updates
+    private readonly executionDelay: number = 300;
     private readonly timeoutInSeconds: number;
     private static readonly DEFAULT_ATTACH_TIMEOUT_SECONDS = 30;
 
@@ -41,14 +64,14 @@ export class DebuggingHandler implements IDebuggingHandler {
         this.timeoutInSeconds = timeoutInSeconds;
     }
 
-    /**
-     * Start a debugging session. Builds a cppvsdbg launch configuration from
-     * `args` and resolves with one of three outcomes:
-     *   - paused:         debugger stopped at a location
-     *   - attached:       session attached but no breakpoint hit within timeout
-     *   - never-attached: session never appeared → throws
-     */
-    public async handleStartDebugging(args: StartDebuggingArgs): Promise<string> {
+    private stateToEnvelope(state: DebugState, textPrefix = ''): HandlerResponse {
+        return {
+            text: textPrefix + state.toString(),
+            structuredContent: state.toJSON(),
+        };
+    }
+
+    public async handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse> {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             throw new Error('No workspace folder open in VS Code');
@@ -70,14 +93,17 @@ export class DebuggingHandler implements IDebuggingHandler {
         switch (outcome) {
             case 'paused': {
                 const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                return `Debug session started. Paused at ${currentState.toString()}`;
+                return this.stateToEnvelope(currentState, 'Debug session started. Paused at ');
             }
             case 'attached': {
+                const runningState = await this.executor.getCurrentDebugState(this.numNextLines);
                 const bps = this.formatBreakpoints();
-                return (
-                    `Debug session started and attached, but no breakpoint hit within ${seconds}s.\n` +
-                    `The program is running. Active breakpoints:\n${bps}`
-                );
+                return {
+                    text:
+                        `Debug session started and attached, but no breakpoint hit within ${seconds}s.\n` +
+                        `The program is running. Active breakpoints:\n${bps}`,
+                    structuredContent: runningState.toJSON(),
+                };
             }
             case 'never-attached':
                 throw new Error(
@@ -87,358 +113,300 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
     }
 
-    /**
-     * Stop the current debugging session
-     */
-    public async handleStopDebugging(): Promise<string> {
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                return 'No active debug session to stop';
-            }
-
-            await this.executor.stopDebugging();
-
-            // Add drill-down reminder
-            return 'Debug session stopped successfully\n\n' + this.getRootCauseAnalysisCheckpointMessage();
-        } catch (error) {
-            throw new Error(`Error stopping debug session: ${error}`);
+    public async handleStopDebugging(): Promise<HandlerResponse> {
+        if (!(await this.executor.hasActiveSession())) {
+            return {
+                text: 'No active debug session to stop',
+                structuredContent: {},
+            };
         }
+        await this.executor.stopDebugging();
+        return {
+            text: 'Debug session stopped successfully\n\n' + this.getRootCauseAnalysisCheckpointMessage(),
+            structuredContent: {},
+        };
     }
 
-    /**
-     * Clear all breakpoints
-     */
-    public async handleClearAllBreakpoints(): Promise<string> {
-        try {
-            const breakpointCount = this.executor.getBreakpoints().length;
-            
-            if (breakpointCount === 0) {
-                return 'No breakpoints to clear';
-            }
-
-            this.executor.clearAllBreakpoints();
-            return `Successfully cleared ${breakpointCount} breakpoint(s)`;
-        } catch (error) {
-            throw new Error(`Error clearing breakpoints: ${error}`);
+    public async handleClearAllBreakpoints(): Promise<HandlerResponse> {
+        const breakpointCount = this.executor.getBreakpoints().length;
+        if (breakpointCount === 0) {
+            return { text: 'No breakpoints to clear', structuredContent: { cleared: 0 } };
         }
+        this.executor.clearAllBreakpoints();
+        return {
+            text: `Successfully cleared ${breakpointCount} breakpoint(s)`,
+            structuredContent: { cleared: breakpointCount },
+        };
     }
 
-    /**
-     * Execute step over command(s)
-     */
-    public async handleStepOver(args?: { steps?: number }): Promise<string> {
+    private async runSteppingCommand(cmd: () => Promise<void>, verb: string): Promise<HandlerResponse> {
+        const reason = await classifySessionState(this.executor);
+        if (reason !== 'ok') return gateErrorFor(reason);
+
+        const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
         try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Please wait for initialization to complete.');
-            }
-
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepOver();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-
-            return afterState.toString();
+            await cmd();
         } catch (error) {
-            throw new Error(`Error executing step over: ${error}`);
+            throw new Error(`Error executing ${verb}: ${error}`);
         }
+        const afterState = await this.waitForStateChange(beforeState);
+        return this.stateToEnvelope(afterState);
     }
 
-    /**
-     * Execute step into command
-     */
-    public async handleStepInto(): Promise<string> {
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Please wait for initialization to complete.');
-            }
-
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepInto();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
-        } catch (error) {
-            throw new Error(`Error executing step into: ${error}`);
-        }
+    public async handleStepOver(_args?: { steps?: number }): Promise<HandlerResponse> {
+        return this.runSteppingCommand(() => this.executor.stepOver(), 'step over');
     }
 
-    /**
-     * Execute step out command
-     */
-    public async handleStepOut(): Promise<string> {
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Please wait for initialization to complete.');
-            }
-
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepOut();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
-        } catch (error) {
-            throw new Error(`Error executing step out: ${error}`);
-        }
+    public async handleStepInto(): Promise<HandlerResponse> {
+        return this.runSteppingCommand(() => this.executor.stepInto(), 'step into');
     }
 
-    /**
-     * Continue execution
-     */
-    public async handleContinue(): Promise<string> {
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Please wait for initialization to complete.');
-            }
-
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.continue();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
-        } catch (error) {
-            throw new Error(`Error executing continue: ${error}`);
-        }
+    public async handleStepOut(): Promise<HandlerResponse> {
+        return this.runSteppingCommand(() => this.executor.stepOut(), 'step out');
     }
 
-    /**
-     * Restart the debugging session
-     */
-    public async handleRestart(): Promise<string> {
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('No active debug session to restart');
-            }
+    public async handleContinue(): Promise<HandlerResponse> {
+        return this.runSteppingCommand(() => this.executor.continue(), 'continue');
+    }
 
+    public async handleRestart(): Promise<HandlerResponse> {
+        if (!(await this.executor.hasActiveSession())) {
+            return gateErrorFor('no_session');
+        }
+        try {
             await this.executor.restart();
-            
-            // Wait for debugger to restart
             await new Promise(resolve => setTimeout(resolve, this.executionDelay));
-
-            return 'Debug session restarted successfully';
+            return {
+                text: 'Debug session restarted successfully',
+                structuredContent: {},
+            };
         } catch (error) {
             throw new Error(`Error restarting debug session: ${error}`);
         }
     }
 
-    /**
-     * Add a breakpoint at specified location
-     */
-    public async handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string> {
-        const { fileFullPath, lineContent } = args;
-        
-        try {
-            // Find the line number containing the line content
-            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
-            const text = document.getText();
-            const lines = text.split(/\r?\n/);
-            const matchingLineNumbers: number[] = [];
-            
-            for (let i = 0; i < lines.length; i++) {
-                if (lines[i].includes(lineContent)) {
-                    matchingLineNumbers.push(i + 1); // Convert to 1-based line numbers
-                }
-            }
-            
-            if (matchingLineNumbers.length === 0) {
-                throw new Error(`Could not find any lines containing: ${lineContent}`);
-            }
-            
-            const uri = vscode.Uri.file(fileFullPath);
-            
-            // Add breakpoints to all matching lines
-            for (const lineNumber of matchingLineNumbers) {
-                await this.executor.addBreakpoint(uri, lineNumber);
-            }
-            
-            if (matchingLineNumbers.length === 1) {
-                return `Breakpoint added at ${fileFullPath}:${matchingLineNumbers[0]}`;
-            } else {
-                const linesList = matchingLineNumbers.join(', ');
-                return `Breakpoints added at ${matchingLineNumbers.length} locations in ${fileFullPath}: lines ${linesList}`;
-            }
-        } catch (error) {
-            throw new Error(`Error adding breakpoint: ${error}`);
+    private async resolveTargetLines(
+        fileFullPath: string,
+        line: number | undefined,
+        lineContent: string | undefined,
+    ): Promise<number[] | HandlerResponse> {
+        if ((line === undefined) === (lineContent === undefined)) {
+            return {
+                isError: true,
+                text: "Provide exactly one of 'line' or 'lineContent'.",
+                structuredContent: { reason: 'bad_input' as BreakpointErrorReason },
+            };
         }
+        if (line !== undefined) return [line];
+
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
+        const matched: number[] = [];
+        for (let i = 0; i < document.lineCount; i++) {
+            if (document.lineAt(i).text.includes(lineContent!)) matched.push(i + 1);
+        }
+        return matched;
     }
 
-    /**
-     * Remove a breakpoint from specified location
-     */
-    public async handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string> {
-        const { fileFullPath, line } = args;
-        
-        try {
-            const uri = vscode.Uri.file(fileFullPath);
-            
-            // Check if breakpoint exists at this location
-            const breakpoints = this.executor.getBreakpoints();
-            const existingBreakpoint = breakpoints.find(bp => {
-                if (bp instanceof vscode.SourceBreakpoint) {
-                    return bp.location.uri.toString() === uri.toString() && 
-                           bp.location.range.start.line === line - 1;
-                }
-                return false;
-            });
-            
-            if (!existingBreakpoint) {
-                return `No breakpoint found at ${fileFullPath}:${line}`;
+    public async handleAddBreakpoint(args: AddBreakpointArgs): Promise<HandlerResponse> {
+        const { fileFullPath, line, lineContent, condition, hitCondition, logMessage, allowMultiple } = args;
+
+        const resolved = await this.resolveTargetLines(fileFullPath, line, lineContent);
+        if (!Array.isArray(resolved)) return resolved;
+        const targetLines = resolved;
+
+        if (lineContent !== undefined) {
+            if (targetLines.length === 0) {
+                return {
+                    isError: true,
+                    text: `No lines in ${fileFullPath} contain: ${lineContent}`,
+                    structuredContent: { reason: 'no_match' as BreakpointErrorReason },
+                };
             }
-            
-            await this.executor.removeBreakpoint(uri, line);
-            return `Breakpoint removed from ${fileFullPath}:${line}`;
-        } catch (error) {
-            throw new Error(`Error removing breakpoint: ${error}`);
+            if (targetLines.length > 1 && !allowMultiple) {
+                return {
+                    isError: true,
+                    text: `lineContent matched ${targetLines.length} lines; pass allowMultiple=true to accept.`,
+                    structuredContent: { reason: 'multi_match' as BreakpointErrorReason, matchedLines: targetLines },
+                };
+            }
         }
+
+        const uri = vscode.Uri.file(fileFullPath);
+        const set = targetLines.map((ln) => ({
+            file: fileFullPath,
+            line: ln,
+            ...(condition ? { condition } : {}),
+            ...(hitCondition ? { hitCondition } : {}),
+            ...(logMessage ? { logMessage } : {}),
+        }));
+        for (const ln of targetLines) {
+            await this.executor.addBreakpoint(uri, ln, { condition, hitCondition, logMessage });
+        }
+
+        const textOut = set.length === 1
+            ? `Breakpoint added at ${fileFullPath}:${targetLines[0]}`
+            : `Breakpoints added at ${set.length} locations in ${fileFullPath}: lines ${targetLines.join(', ')}`;
+
+        return { text: textOut, structuredContent: { set } };
     }
 
-    /**
-     * List all active breakpoints
-     */
-    public async handleListBreakpoints(): Promise<string> {
-        try {
-            const breakpoints = this.executor.getBreakpoints();
-            
-            if (breakpoints.length === 0) {
-                return 'No breakpoints currently set';
-            }
+    public async handleRemoveBreakpoint(args: RemoveBreakpointArgs): Promise<HandlerResponse> {
+        const { fileFullPath, line, lineContent } = args;
 
-            let breakpointList = 'Active Breakpoints:\n';
-            breakpoints.forEach((bp, index) => {
-                if (bp instanceof vscode.SourceBreakpoint) {
-                    const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop();
-                    const line = bp.location.range.start.line + 1;
-                    breakpointList += `${index + 1}. ${fileName}:${line}\n`;
-                } else if (bp instanceof vscode.FunctionBreakpoint) {
-                    breakpointList += `${index + 1}. Function: ${bp.functionName}\n`;
-                }
-            });
+        const resolved = await this.resolveTargetLines(fileFullPath, line, lineContent);
+        if (!Array.isArray(resolved)) return resolved;
+        const targetLines = resolved;
 
-            return breakpointList;
-        } catch (error) {
-            throw new Error(`Error listing breakpoints: ${error}`);
+        const uri = vscode.Uri.file(fileFullPath);
+        const uriStr = uri.toString();
+        const targetSet = new Set(targetLines.map((ln) => ln - 1));
+        const toRemove = this.executor.getBreakpoints().filter((bp): bp is vscode.SourceBreakpoint =>
+            bp instanceof vscode.SourceBreakpoint &&
+            bp.location.uri.toString() === uriStr &&
+            targetSet.has(bp.location.range.start.line),
+        );
+
+        if (toRemove.length === 0) {
+            return {
+                isError: true,
+                text: `No matching breakpoint found in ${fileFullPath}.`,
+                structuredContent: { reason: 'no_match' as BreakpointErrorReason, removed: 0 },
+            };
         }
+
+        vscode.debug.removeBreakpoints(toRemove);
+        return {
+            text: `Removed ${toRemove.length} breakpoint(s) in ${fileFullPath}`,
+            structuredContent: { removed: toRemove.length },
+        };
     }
 
-    /**
-     * Get variables from current debug context
-     */
-    public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<string> {
+    public async handleListBreakpoints(): Promise<HandlerResponse> {
+        const breakpoints = this.executor.getBreakpoints();
+        if (breakpoints.length === 0) {
+            return {
+                text: 'No breakpoints currently set',
+                structuredContent: { breakpoints: [] },
+            };
+        }
+
+        const structured: Array<Record<string, unknown>> = [];
+        let textOut = 'Active Breakpoints:\n';
+        breakpoints.forEach((bp, index) => {
+            if (bp instanceof vscode.SourceBreakpoint) {
+                const fileName = path.basename(bp.location.uri.fsPath);
+                const line = bp.location.range.start.line + 1;
+                textOut += `${index + 1}. ${fileName}:${line}\n`;
+                structured.push({
+                    file: bp.location.uri.fsPath,
+                    line,
+                    ...(bp.condition ? { condition: bp.condition } : {}),
+                    ...(bp.hitCondition ? { hitCondition: bp.hitCondition } : {}),
+                    ...(bp.logMessage ? { logMessage: bp.logMessage } : {}),
+                });
+            } else if (bp instanceof vscode.FunctionBreakpoint) {
+                textOut += `${index + 1}. Function: ${bp.functionName}\n`;
+                structured.push({ functionName: bp.functionName });
+            }
+        });
+
+        return { text: textOut, structuredContent: { breakpoints: structured } };
+    }
+
+    public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse> {
         const { scope = 'all' } = args;
-        
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Start debugging first and ensure execution is paused.');
-            }
+        const reason = await classifySessionState(this.executor);
+        if (reason !== 'ok') return gateErrorFor(reason);
 
-            const activeStackItem = vscode.debug.activeStackItem;
-            if (!activeStackItem || !('frameId' in activeStackItem)) {
-                throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
-            }
-
-            const variablesData = await this.executor.getVariables(activeStackItem.frameId, scope);
-            
-            if (!variablesData.scopes || variablesData.scopes.length === 0) {
-                return 'No variable scopes available at current execution point.';
-            }
-
-            let variablesInfo = 'Variables:\n==========\n\n';
-
-            for (const scopeItem of variablesData.scopes) {
-                variablesInfo += `${scopeItem.name}:\n`;
-                
-                if (scopeItem.error) {
-                    variablesInfo += `  Error retrieving variables: ${scopeItem.error}\n`;
-                } else if (scopeItem.variables && scopeItem.variables.length > 0) {
-                    for (const variable of scopeItem.variables) {
-                        variablesInfo += `  ${variable.name}: ${variable.value}`;
-                        if (variable.type) {
-                            variablesInfo += ` (${variable.type})`;
-                        }
-                        variablesInfo += '\n';
-                    }
-                } else {
-                    variablesInfo += '  No variables in this scope\n';
-                }
-                
-                variablesInfo += '\n';
-            }
-
-            return variablesInfo;
-        } catch (error) {
-            throw new Error(`Error getting variables: ${error}`);
+        const activeStackItem = vscode.debug.activeStackItem;
+        if (!activeStackItem || !('frameId' in activeStackItem)) {
+            return gateErrorFor('not_paused');
         }
-    }
 
-    /**
-     * Evaluate an expression in current debug context
-     */
-    public async handleEvaluateExpression(args: { expression: string }): Promise<string> {
-        const { expression } = args;
-        
-        try {
-            if (!(await this.executor.hasActiveSession())) {
-                throw new Error('Debug session is not ready. Start debugging first and ensure execution is paused.');
-            }
+        const variablesData = await this.executor.getVariables(activeStackItem.frameId, scope);
 
-            const activeStackItem = vscode.debug.activeStackItem;
-            if (!activeStackItem || !('frameId' in activeStackItem)) {
-                throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
-            }
+        if (!variablesData.scopes || variablesData.scopes.length === 0) {
+            return {
+                text: 'No variable scopes available at current execution point.',
+                structuredContent: { scopes: [] },
+            };
+        }
 
-            const response = await this.executor.evaluateExpression(expression, activeStackItem.frameId);
-
-            if (response && response.result !== undefined) {
-                let resultText = `Expression: ${expression}\n`;
-                resultText += `Result: ${response.result}`;
-                if (response.type) {
-                    resultText += ` (${response.type})`;
+        let variablesInfo = 'Variables:\n==========\n\n';
+        for (const scopeItem of variablesData.scopes) {
+            variablesInfo += `${scopeItem.name}:\n`;
+            if (scopeItem.error) {
+                variablesInfo += `  Error retrieving variables: ${scopeItem.error}\n`;
+            } else if (scopeItem.variables && scopeItem.variables.length > 0) {
+                for (const variable of scopeItem.variables) {
+                    variablesInfo += `  ${variable.name}: ${variable.value}`;
+                    if (variable.type) variablesInfo += ` (${variable.type})`;
+                    variablesInfo += '\n';
                 }
-
-                return resultText;
             } else {
-                throw new Error('Failed to evaluate expression');
+                variablesInfo += '  No variables in this scope\n';
             }
-        } catch (error) {
-            throw new Error(`Error evaluating expression: ${error}`);
+            variablesInfo += '\n';
         }
+
+        return { text: variablesInfo, structuredContent: variablesData };
     }
 
-    /**
-     * Get current debug state
-     */
+    public async handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse> {
+        const reason = await classifySessionState(this.executor);
+        if (reason !== 'ok') return gateErrorFor(reason);
+
+        const activeStackItem = vscode.debug.activeStackItem;
+        if (!activeStackItem || !('frameId' in activeStackItem)) {
+            return gateErrorFor('not_paused');
+        }
+
+        const response = await this.executor.evaluateExpression(args.expression, activeStackItem.frameId);
+        if (!response || response.result === undefined) {
+            throw new Error('Failed to evaluate expression');
+        }
+
+        const textOut = `Expression: ${args.expression}\nResult: ${response.result}${response.type ? ` (${response.type})` : ''}`;
+        return {
+            text: textOut,
+            structuredContent: {
+                expression: args.expression,
+                result: response.result,
+                type: response.type ?? null,
+            },
+        };
+    }
+
+    public async handleGetCurrentLocation(): Promise<HandlerResponse> {
+        const reason = await classifySessionState(this.executor);
+        if (reason !== 'ok') return gateErrorFor(reason);
+        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        return this.stateToEnvelope(state);
+    }
+
+    public async handleGetStackTrace(): Promise<HandlerResponse> {
+        return this.handleGetCurrentLocation();
+    }
+
+    public async handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse> {
+        const buffer = this.executor.getOutputBuffer();
+        if (!buffer) {
+            return { text: '', structuredContent: { content: '', truncated: false } };
+        }
+        const read = typeof args.tail === 'number' && args.tail > 0
+            ? buffer.tail(args.tail)
+            : buffer.read();
+        return { text: read.content, structuredContent: read };
+    }
+
     public async getCurrentDebugState(): Promise<DebugState> {
         return await this.executor.getCurrentDebugState(this.numNextLines);
     }
 
-    /**
-     * Check if debugging session is active
-     */
     public async isDebuggingActive(): Promise<boolean> {
         return await this.executor.hasActiveSession();
     }
 
-    /**
-     * Wait up to timeoutMs for the session to reach a paused state.
-     * Returns:
-     *   - "paused"         : debugger is stopped with location info
-     *   - "attached"       : session object exists but never paused within timeout
-     *   - "never-attached" : no session object ever appeared
-     */
     private async waitForSessionOutcome(
         timeoutMs: number,
     ): Promise<'paused' | 'attached' | 'never-attached'> {
@@ -461,10 +429,6 @@ export class DebuggingHandler implements IDebuggingHandler {
         return this.executor.hasAttachedSession() ? 'attached' : 'never-attached';
     }
 
-    /**
-     * Render vscode.debug.breakpoints (source breakpoints only) as a bulleted
-     * list of "<fsPath>:<line>" entries. Returns a placeholder if there are none.
-     */
     private formatBreakpoints(): string {
         const sourceBps = vscode.debug.breakpoints.filter(
             (bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint,
@@ -477,93 +441,52 @@ export class DebuggingHandler implements IDebuggingHandler {
             .join('\n');
     }
 
-    /**
-     * Wait for debugger state to change from the initial state using exponential backoff
-     */
     private async waitForStateChange(beforeState: DebugState): Promise<DebugState> {
-        const baseDelay = 1000; // Start with 1 second
-        const maxDelay = 1000; // Cap at 1 second
+        const baseDelay = 1000;
+        const maxDelay = 1000;
         const startTime = Date.now();
         let attempt = 0;
-                
+
         while (Date.now() - startTime < this.timeoutInSeconds * 1000) {
             const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-            
+
             if (this.hasStateChanged(beforeState, currentState)) {
                 return currentState;
             }
-            
-            // If session ended, return immediately
+
             if (!currentState.sessionActive) {
                 return currentState;
             }
-            
+
             logger.info(`[Attempt ${attempt + 1}] Waiting for debugger state to change...`);
 
-            // Calculate delay using exponential backoff with jitter (same as waitForActiveDebugSession)
             const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
-            const jitteredDelay = delay + Math.random() * 200; // Add up to 200ms jitter
+            const jitteredDelay = delay + Math.random() * 200;
 
             await new Promise(resolve => setTimeout(resolve, jitteredDelay));
             attempt++;
         }
-        
-        // If we timeout, return the current state (might be unchanged)
+
         logger.info('State change detection timed out, returning current state');
         return await this.executor.getCurrentDebugState(this.numNextLines);
     }
 
-    /**
-     * Determine if the debugger state has meaningfully changed
-     */
     private hasStateChanged(beforeState: DebugState, afterState: DebugState): boolean {
         if (beforeState.hasLocationInfo() && !afterState.hasLocationInfo() && afterState.sessionActive) {
             return false;
         }
-
-        // If session status changed, that's a meaningful change
-        if (beforeState.sessionActive !== afterState.sessionActive) {
-            return true;
-        }
-        
-        // If session is no longer active, that's a change
-        if (!afterState.sessionActive) {
-            return true;
-        }
-        
-        // If either state lacks location info, compare what we can
+        if (beforeState.sessionActive !== afterState.sessionActive) return true;
+        if (!afterState.sessionActive) return true;
         if (!beforeState.hasLocationInfo() || !afterState.hasLocationInfo()) {
-            // If one has location info and the other doesn't, that's a change
             return beforeState.hasLocationInfo() !== afterState.hasLocationInfo();
         }
-        
-        // Compare file paths - if we moved to a different file, that's a change
-        if (beforeState.fileFullPath !== afterState.fileFullPath) {
-            return true;
-        }
-        
-        // Compare line numbers - if we moved to a different line, that's a change
-        if (beforeState.currentLine !== afterState.currentLine) {
-            return true;
-        }
-        
-        // Compare frame names - if we moved to a different function/method, that's a change
-        if (beforeState.frameName !== afterState.frameName) {
-            return true;
-        }
-        
-        // Compare frame IDs - internal frame change
-        if (beforeState.frameId !== afterState.frameId) {
-            return true;
-        }
-        
-        // If we get here, no meaningful change was detected
+        if (beforeState.fileFullPath !== afterState.fileFullPath) return true;
+        if (beforeState.currentLine !== afterState.currentLine) return true;
+        if (beforeState.frameName !== afterState.frameName) return true;
+        if (beforeState.frameId !== afterState.frameId) return true;
         return false;
     }
 
-    /**
-     * Get the universal drill-down reminder message
-     */
     private getRootCauseAnalysisCheckpointMessage(): string {
         return `⚠️ **ROOT CAUSE ANALYSIS CHECKPOINT**
 
@@ -573,7 +496,7 @@ Before concluding your debugging session:
 
 🔍 **If you only identified WHERE it went wrong:**
 - Variable is null/undefined
-- Function returned unexpected value  
+- Function returned unexpected value
 - Error occurred at specific line
 - Condition evaluated incorrectly
 

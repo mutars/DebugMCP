@@ -2,6 +2,13 @@
 
 import * as vscode from 'vscode';
 import { DebugState, StackFrame } from './debugState';
+import { OutputRingBuffer } from './utils/outputRingBuffer';
+
+export interface BreakpointOptions {
+    condition?: string;
+    hitCondition?: string;
+    logMessage?: string;
+}
 
 /**
  * Interface for debugging execution operations
@@ -14,7 +21,7 @@ export interface IDebuggingExecutor {
     stepOut(): Promise<void>;
     continue(): Promise<void>;
     restart(): Promise<void>;
-    addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
+    addBreakpoint(uri: vscode.Uri, line: number, opts?: BreakpointOptions): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
     getVariables(frameId: number, scope?: 'local' | 'global' | 'all'): Promise<any>;
@@ -24,12 +31,23 @@ export interface IDebuggingExecutor {
     hasActiveSession(): Promise<boolean>;
     hasAttachedSession(): boolean;
     getActiveSession(): vscode.DebugSession | undefined;
+    setOutputBuffer(buffer: OutputRingBuffer): void;
+    getOutputBuffer(): OutputRingBuffer | null;
 }
 
 /**
  * Responsible for executing VS Code debugging commands and managing debug sessions
  */
 export class DebuggingExecutor implements IDebuggingExecutor {
+    private outputBuffer: OutputRingBuffer | null = null;
+
+    public setOutputBuffer(buffer: OutputRingBuffer): void {
+        this.outputBuffer = buffer;
+    }
+
+    public getOutputBuffer(): OutputRingBuffer | null {
+        return this.outputBuffer;
+    }
 
     /**
      * Start a debugging session
@@ -123,12 +141,21 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Add a breakpoint at specified location
+     * Add a breakpoint at specified location, optionally with a condition,
+     * hit-condition, or logMessage (logpoint).
      */
-    public async addBreakpoint(uri: vscode.Uri, line: number): Promise<void> {
+    public async addBreakpoint(
+        uri: vscode.Uri,
+        line: number,
+        opts: BreakpointOptions = {},
+    ): Promise<void> {
         try {
             const breakpoint = new vscode.SourceBreakpoint(
-                new vscode.Location(uri, new vscode.Position(line - 1, 0))
+                new vscode.Location(uri, new vscode.Position(line - 1, 0)),
+                true,
+                opts.condition,
+                opts.hitCondition,
+                opts.logMessage,
             );
             vscode.debug.addBreakpoints([breakpoint]);
         } catch (error) {
@@ -365,11 +392,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         }
     }
 
-    /**
-     * Returns true iff VS Code has an active debug session object,
-     * regardless of whether it is paused at a location.
-     * Used to distinguish "launched but running" from "launch failed".
-     */
+    /** Distinguishes "launched but running" from "launch failed" — paused-ness not required. */
     public hasAttachedSession(): boolean {
         return !!vscode.debug.activeDebugSession;
     }

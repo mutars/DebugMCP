@@ -2,10 +2,7 @@
 
 import * as path from 'path';
 
-/**
- * Structural mirror of vscode.DebugConfiguration, kept vscode-runtime-free so
- * this module can be unit-tested from a plain Node/vitest harness.
- */
+/** Mirror of vscode.DebugConfiguration, vscode-runtime-free so unit tests don't need the host. */
 export interface DebugConfigurationLike {
     type: string;
     request: string;
@@ -30,14 +27,7 @@ export interface StartDebuggingArgs {
     waitForBreakpointSeconds?: number;
 }
 
-/**
- * Build a cppvsdbg DebugConfiguration from tool-call args.
- *
- * Merge order (later wins):
- *   1. extraConfig (escape hatch)
- *   2. explicit fields (with defaults filled in)
- *   3. hardcoded type/request/name
- */
+// Merge order (later wins): extraConfig → explicit fields + defaults → hardcoded type/request/name.
 export function buildCppvsdbgConfig(
     args: StartDebuggingArgs,
     workspaceRoot: string,
@@ -48,7 +38,7 @@ export function buildCppvsdbgConfig(
         args: args.args ?? [],
         cwd: args.cwd ?? workspaceRoot,
         environment: args.environment ?? [],
-        console: args.console ?? "integratedTerminal",
+        console: args.console ?? "internalConsole",
         stopAtEntry: args.stopAtEntry ?? false,
         type: "cppvsdbg",
         request: "launch",

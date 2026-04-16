@@ -10,18 +10,15 @@ import {
     DebuggingHandler,
     IDebuggingHandler
 } from '.';
+import { HandlerResponse } from './debuggingHandler';
+import { OutputRingBuffer } from './utils/outputRingBuffer';
 import { logger } from './utils/logger';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-/**
- * Distinctive stderr token emitted when the HTTP server fails to bind with EADDRINUSE.
- * Headless wrappers can scrape VS Code server stderr for this to fail fast instead of
- * waiting for a full readiness timeout.
- *
- * The `log` parameter is injectable for testing (extension-host environments shadow
- * global console); production callers pass no argument and get the default stderr path.
- */
+// Emits a distinctive stderr token on EADDRINUSE so wrappers can fail fast instead of
+// waiting for a readiness timeout. Writes to stderr directly because the extension host
+// shadows global console; `log` is injectable for tests.
 export function logBindFailure(
     port: number,
     err: NodeJS.ErrnoException,
@@ -44,9 +41,9 @@ export class DebugMCPServer {
     private debuggingHandler: IDebuggingHandler;
     private transports: Map<string, StreamableHTTPServerTransport> = new Map();
 
-    constructor(port: number, timeoutInSeconds: number) {
-        // Initialize the debugging components with dependency injection
+    constructor(port: number, timeoutInSeconds: number, outputBuffer?: OutputRingBuffer) {
         const executor = new DebuggingExecutor();
+        if (outputBuffer) executor.setOutputBuffer(outputBuffer);
         this.debuggingHandler = new DebuggingHandler(executor, timeoutInSeconds);
         this.port = port;
     }
@@ -72,8 +69,19 @@ export class DebugMCPServer {
     /**
      * Setup MCP tools that delegate to the debugging handler
      */
+    private wrapResponse(r: HandlerResponse) {
+        return {
+            content: [{ type: 'text' as const, text: r.text }],
+            structuredContent: r.structuredContent as Record<string, unknown>,
+            ...(r.isError ? { isError: true } : {}),
+        };
+    }
+
+    private delegate<A>(fn: (a: A) => Promise<HandlerResponse>): (a: A) => Promise<ReturnType<DebugMCPServer['wrapResponse']>> {
+        return async (a: A) => this.wrapResponse(await fn(a));
+    }
+
     private setupTools() {
-        // Get debug instructions tool (for clients that don't support MCP resources like GitHub Copilot)
         this.mcpServer!.registerTool('get_debug_instructions', {
             description: 'Get the debugging guide with step-by-step instructions for effective debugging. ' +
                 'Returns comprehensive guidance including breakpoint strategies, root cause analysis framework, ' +
@@ -83,7 +91,6 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: content }] };
         });
 
-        // Start debugging tool
         this.mcpServer!.registerTool('start_debugging', {
             description:
                 'IMPORTANT DEBUGGING TOOL - Launch a C++ binary under the cppvsdbg debugger.\n\n' +
@@ -132,120 +139,92 @@ export class DebugMCPServer {
                     "'attached-but-running' success result. Defaults to 30."
                 ),
             },
-        }, async (args) => {
-            const result = await this.debuggingHandler.handleStartDebugging(args);
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate((args: any) => this.debuggingHandler.handleStartDebugging(args)));
 
-        // Stop debugging tool
         this.mcpServer!.registerTool('stop_debugging', {
             description: 'Stop the current debug session',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStopDebugging();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleStopDebugging()));
 
-        // Step over tool
         this.mcpServer!.registerTool('step_over', {
             description: 'Execute the current line of code without diving into it.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOver();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleStepOver()));
 
-        // Step into tool
         this.mcpServer!.registerTool('step_into', {
             description: 'Dive into the current line of code.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepInto();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleStepInto()));
 
-        // Step out tool
         this.mcpServer!.registerTool('step_out', {
             description: 'Step out of the current function',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOut();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleStepOut()));
 
-        // Continue execution tool
         this.mcpServer!.registerTool('continue_execution', {
             description: 'Resume program execution until the next breakpoint is hit or the program completes.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleContinue();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleContinue()));
 
-        // Restart debugging tool
         this.mcpServer!.registerTool('restart_debugging', {
             description: 'Restart the debug session from the beginning with the same configuration.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleRestart();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleRestart()));
 
-        // Add breakpoint tool
         this.mcpServer!.registerTool('add_breakpoint', {
-            description: 'Set a breakpoint to pause execution at a critical line of code. Essential for debugging: pause before potential errors, examine state at decision points, or verify code paths. Breakpoints let you inspect variables and control flow at exact moments.',
+            description: 'Set a breakpoint. Provide exactly one of line or lineContent. Multi-match on lineContent is an error unless allowMultiple is true.',
             inputSchema: {
-                fileFullPath: z.string().describe('Full path to the file'),
-                lineContent: z.string().describe('Line content'),
+                fileFullPath: z.string().describe('Full path to the source file.'),
+                line: z.number().int().positive().optional().describe('1-based line number.'),
+                lineContent: z.string().optional().describe('Content substring to locate the line.'),
+                condition: z.string().optional().describe('DAP condition expression (e.g., "i > 5").'),
+                hitCondition: z.string().optional().describe('Hit-count expression (e.g., ">= 5", "% 10").'),
+                logMessage: z.string().optional().describe('Logpoint: print this message instead of pausing. Supports {expr} substitution per DAP.'),
+                allowMultiple: z.boolean().optional().describe('If true, lineContent matches on multiple lines all get breakpoints. Default false.'),
             },
-        }, async (args: { fileFullPath: string; lineContent: string }) => {
-            const result = await this.debuggingHandler.handleAddBreakpoint(args);
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate((args: any) => this.debuggingHandler.handleAddBreakpoint(args)));
 
-        // Remove breakpoint tool
         this.mcpServer!.registerTool('remove_breakpoint', {
-            description: 'Remove a breakpoint that is no longer needed.',
+            description: 'Remove a breakpoint. Provide exactly one of line or lineContent.',
             inputSchema: {
-                fileFullPath: z.string().describe('Full path to the file'),
-                line: z.number().describe('Line number (1-based)'),
+                fileFullPath: z.string().describe('Full path to the file.'),
+                line: z.number().int().positive().optional(),
+                lineContent: z.string().optional(),
             },
-        }, async (args: { fileFullPath: string; line: number }) => {
-            const result = await this.debuggingHandler.handleRemoveBreakpoint(args);
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate((args: any) => this.debuggingHandler.handleRemoveBreakpoint(args)));
 
-        // Clear all breakpoints tool
         this.mcpServer!.registerTool('clear_all_breakpoints', {
             description: 'Clear all breakpoints at once. Use this after verifying the root cause to clean up before moving on to the next task.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleClearAllBreakpoints();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleClearAllBreakpoints()));
 
-        // List breakpoints tool
         this.mcpServer!.registerTool('list_breakpoints', {
             description: 'View all currently set breakpoints across all files.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleListBreakpoints();
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate(() => this.debuggingHandler.handleListBreakpoints()));
 
-        // Get variables tool
         this.mcpServer!.registerTool('get_variables_values', {
             description: 'Inspect all variable values at the current execution point. This is your window into program state - see what data looks like at runtime, verify assumptions, identify unexpected values, and understand why code behaves as it does.',
             inputSchema: {
                 scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
             },
-        }, async (args: { scope?: 'local' | 'global' | 'all' }) => {
-            const result = await this.debuggingHandler.handleGetVariables(args);
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate((args: any) => this.debuggingHandler.handleGetVariables(args)));
 
-        // Evaluate expression tool
+        this.mcpServer!.registerTool('get_current_location', {
+            description: 'Read-only: return current DebugState (file, line, stack, frame). No side effects.',
+        }, this.delegate(() => this.debuggingHandler.handleGetCurrentLocation()));
+
+        this.mcpServer!.registerTool('get_stack_trace', {
+            description: 'Read-only: return the current call stack as DebugState. Same shape as step_*/continue responses.',
+        }, this.delegate(() => this.debuggingHandler.handleGetStackTrace()));
+
+        this.mcpServer!.registerTool('get_program_output', {
+            description: 'Read captured stdout/stderr from the debuggee program. Buffer is session-scoped and cleared on each start_debugging.',
+            inputSchema: {
+                tail: z.number().int().positive().optional().describe(
+                    "If set, return only the last N lines of captured output."
+                ),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleGetProgramOutput(args)));
+
         this.mcpServer!.registerTool('evaluate_expression', {
             description: 'Powerful runtime expression evaluator: Test hypotheses, check computed values, call methods, or inspect object properties in the live debug context. Goes beyond simple variable inspection - evaluate any valid expression in the target language.',
             inputSchema: {
                 expression: z.string().describe('Expression to evaluate in the current programming language context'),
             },
-        }, async (args: { expression: string }) => {
-            const result = await this.debuggingHandler.handleEvaluateExpression(args);
-            return { content: [{ type: 'text' as const, text: result }] };
-        });
+        }, this.delegate((args: any) => this.debuggingHandler.handleEvaluateExpression(args)));
     }
 
     /**

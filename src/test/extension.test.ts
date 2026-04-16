@@ -24,32 +24,14 @@ suite('AgentConfigurationManager.shouldShowPopup headless gate', () => {
         } as any;
     }
 
-    test('returns false when debugmcp.headless is true, even if popup unshown', async () => {
-        const origGet = vscode.workspace.getConfiguration;
-        (vscode.workspace as any).getConfiguration = () => ({
-            get: (_key: string, def: any) => (_key === 'headless' ? true : def),
-        });
-        try {
-            const mgr = new AgentConfigurationManager(makeContext(false), 180, 3001);
-            const result = await mgr.shouldShowPopup();
-            assert.strictEqual(result, false);
-        } finally {
-            (vscode.workspace as any).getConfiguration = origGet;
-        }
+    test('returns false when headless is true, even if popup unshown', async () => {
+        const mgr = new AgentConfigurationManager(makeContext(false), 180, 3001, true);
+        assert.strictEqual(await mgr.shouldShowPopup(), false);
     });
 
     test('returns true when headless is false and popup not yet shown', async () => {
-        const origGet = vscode.workspace.getConfiguration;
-        (vscode.workspace as any).getConfiguration = () => ({
-            get: (_key: string, def: any) => (_key === 'headless' ? false : def),
-        });
-        try {
-            const mgr = new AgentConfigurationManager(makeContext(false), 180, 3001);
-            const result = await mgr.shouldShowPopup();
-            assert.strictEqual(result, true);
-        } finally {
-            (vscode.workspace as any).getConfiguration = origGet;
-        }
+        const mgr = new AgentConfigurationManager(makeContext(false), 180, 3001, false);
+        assert.strictEqual(await mgr.shouldShowPopup(), true);
     });
 });
 

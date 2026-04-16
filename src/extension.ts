@@ -5,6 +5,8 @@ import { DebugMCPServer } from './debugMCPServer';
 import { AgentConfigurationManager } from './utils/agentConfigurationManager';
 import { logger, LogLevel } from './utils/logger';
 import { resolvePort } from './utils/portResolver';
+import { OutputRingBuffer } from './utils/outputRingBuffer';
+import { registerOutputTracker, OUTPUT_BUFFER_CAPACITY } from './utils/debugOutputTracker';
 
 let mcpServer: DebugMCPServer | null = null;
 let agentConfigManager: AgentConfigurationManager | null = null;
@@ -28,7 +30,10 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     // Initialize Agent Configuration Manager
-    agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort);
+    agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort, headless);
+
+    const outputBuffer = new OutputRingBuffer(OUTPUT_BUFFER_CAPACITY);
+    registerOutputTracker(context, outputBuffer);
 
     // Migrate existing SSE configurations to streamableHttp (for backward compatibility)
     if (!headless) {
@@ -43,7 +48,7 @@ export async function activate(context: vscode.ExtensionContext) {
     try {
         logger.info('Starting MCP server initialization...');
 
-        mcpServer = new DebugMCPServer(serverPort, timeoutInSeconds);
+        mcpServer = new DebugMCPServer(serverPort, timeoutInSeconds, outputBuffer);
         await mcpServer.initialize();
         await mcpServer.start();
 
