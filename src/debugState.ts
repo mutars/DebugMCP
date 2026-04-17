@@ -176,6 +176,31 @@ export class DebugState {
     }
 
     public toString(): string {
-        return JSON.stringify(this.toJSON(), null, 2);
+        const paused = this.sessionActive && this.hasLocationInfo();
+        if (!paused) {
+            return `Not paused (sessionActive=${this.sessionActive})`;
+        }
+        const lines: string[] = [];
+        lines.push(`Paused at ${this.fileName}:${this.currentLine} in ${this.frameName ?? '<unknown>'}`);
+        if (this.nextLines.length > 0) {
+            lines.push("Next:");
+            const base = this.currentLine ?? 0;
+            this.nextLines.forEach((text, i) => {
+                lines.push(`  ${base + 1 + i}: ${text}`);
+            });
+        }
+        lines.push("Stack:");
+        const MAX_FRAMES = 6;
+        const frames = this.stackTrace;
+        frames.slice(0, MAX_FRAMES).forEach((f) => {
+            lines.push(`  ${f.name}:${f.line ?? '?'}`);
+        });
+        if (frames.length > MAX_FRAMES) {
+            lines.push(`  ... (${frames.length - MAX_FRAMES} more)`);
+        }
+        if (this.breakpoints.length > 0) {
+            lines.push(`Breakpoints: ${this.breakpoints.join(", ")}`);
+        }
+        return lines.join("\n");
     }
 }

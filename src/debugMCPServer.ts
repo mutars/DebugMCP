@@ -83,9 +83,7 @@ export class DebugMCPServer {
 
     private setupTools() {
         this.mcpServer!.registerTool('get_debug_instructions', {
-            description: 'Get the debugging guide with step-by-step instructions for effective debugging. ' +
-                'Returns comprehensive guidance including breakpoint strategies, root cause analysis framework, ' +
-                'and best practices. Call this before starting a debug session.',
+            description: 'Return the DebugMCP debugging guide: breakpoint strategies, root-cause framework, best practices.',
         }, async () => {
             const content = await this.loadMarkdownFile('agent-resources/debug_instructions.md');
             return { content: [{ type: 'text' as const, text: content }] };
@@ -93,125 +91,105 @@ export class DebugMCPServer {
 
         this.mcpServer!.registerTool('start_debugging', {
             description:
-                'IMPORTANT DEBUGGING TOOL - Launch a C++ binary under the cppvsdbg debugger.\n\n' +
-                'USE THIS WHEN:\n' +
-                '• You need to launch a Windows C++ executable for debugging\n' +
-                '• Any bug, error, or unexpected behavior occurs in a C++ program\n\n' +
-                'The tool builds a launch configuration from the fields below. No launch.json ' +
-                'is read or written. `type` is always "cppvsdbg" and `request` is always "launch".\n\n' +
-                '⚠️ Before first use in a project, read resource debugmcp://docs/debug_instructions.',
+                'Launch a C++ executable under the cppvsdbg debugger. Builds a launch config from the fields below (no launch.json is read). `type` is always `cppvsdbg`, `request` always `launch`.',
             inputSchema: {
                 program: z.string().describe(
-                    "Absolute path to the .exe to launch, or a path using ${workspaceFolder}. " +
-                    "Examples: 'C:/repo/build/app.exe', '${workspaceFolder}/bin/x64/app_d.exe'. Required."
+                    "Absolute path to the .exe, or a path using ${workspaceFolder}. Required."
                 ),
                 args: z.array(z.string()).optional().describe(
-                    "Arguments passed to the program. Each element is one argv token (no shell splitting). " +
-                    "Defaults to []."
+                    "Program arguments, one argv token per array element (no shell splitting)."
                 ),
                 cwd: z.string().optional().describe(
-                    "Working directory for the program. Supports ${workspaceFolder}. " +
-                    "Defaults to the workspace root."
+                    "Working directory for the program. ${workspaceFolder} is supported. Defaults to the workspace root."
                 ),
-                environment: z.array(z.object({
-                    name: z.string(),
-                    value: z.string(),
-                })).optional().describe(
-                    "Environment variables as {name, value} pairs. Values support ${workspaceFolder} " +
-                    "and ${env:VAR}. Defaults to []."
+                environment: z.record(z.string()).optional().describe(
+                    "Environment variables as a record, e.g. { \"VAR\": \"value\" }. " +
+                    "Values support ${workspaceFolder} and ${env:VAR}."
                 ),
                 console: z.enum([
                     "integratedTerminal", "internalConsole", "externalTerminal", "newExternalWindow",
                 ]).optional().describe(
-                    "Where the program's stdout/stdin go. Defaults to 'integratedTerminal'."
+                    "Destination for the program's stdout/stdin. Defaults to 'internalConsole'."
                 ),
                 stopAtEntry: z.boolean().optional().describe(
-                    "If true, break on program entry (main). Defaults to false."
+                    "If true, break on program entry (main)."
                 ),
                 extraConfig: z.record(z.unknown()).optional().describe(
-                    "Escape hatch: additional cppvsdbg fields merged into the final DebugConfiguration. " +
-                    "Use for rarely-needed fields like sourceFileMap, symbolSearchPath, visualizerFile, " +
-                    "enableDebugHeap, logging. Values here override defaults but NOT the explicit fields " +
-                    "above. Hardcoded type/request/name cannot be overridden."
+                    "Additional cppvsdbg fields merged into the launch config. Use for sourceFileMap, symbolSearchPath, etc. Cannot override type, request, or name."
                 ),
                 waitForBreakpointSeconds: z.number().int().positive().optional().describe(
-                    "How long to wait for a breakpoint (or entry) to be hit before returning the " +
-                    "'attached-but-running' success result. Defaults to 30."
+                    "Max seconds to wait for a breakpoint or entry-stop before returning the attached-but-running result. Defaults to 30."
                 ),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleStartDebugging(args)));
 
         this.mcpServer!.registerTool('stop_debugging', {
-            description: 'Stop the current debug session',
+            description: 'End the active debug session.',
         }, this.delegate(() => this.debuggingHandler.handleStopDebugging()));
 
         this.mcpServer!.registerTool('step_over', {
-            description: 'Execute the current line of code without diving into it.',
+            description: 'Step over the current line; do not enter called functions.',
         }, this.delegate(() => this.debuggingHandler.handleStepOver()));
 
         this.mcpServer!.registerTool('step_into', {
-            description: 'Dive into the current line of code.',
+            description: 'Step into the call on the current line; step over if none.',
         }, this.delegate(() => this.debuggingHandler.handleStepInto()));
 
         this.mcpServer!.registerTool('step_out', {
-            description: 'Step out of the current function',
+            description: 'Run until the current function returns, then pause in the caller.',
         }, this.delegate(() => this.debuggingHandler.handleStepOut()));
 
         this.mcpServer!.registerTool('continue_execution', {
-            description: 'Resume program execution until the next breakpoint is hit or the program completes.',
+            description: 'Resume execution until the next breakpoint or program exit.',
         }, this.delegate(() => this.debuggingHandler.handleContinue()));
 
         this.mcpServer!.registerTool('restart_debugging', {
-            description: 'Restart the debug session from the beginning with the same configuration.',
+            description: 'Restart the active debug session with the same configuration.',
         }, this.delegate(() => this.debuggingHandler.handleRestart()));
 
         this.mcpServer!.registerTool('add_breakpoint', {
-            description: 'Set a breakpoint. Provide exactly one of line or lineContent. Multi-match on lineContent is an error unless allowMultiple is true.',
+            description: 'Set a breakpoint. Provide either `line` or `lineContent` (not both). If `lineContent` matches multiple lines, set `allowMultiple` to accept all matches.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the source file.'),
                 line: z.number().int().positive().optional().describe('1-based line number.'),
-                lineContent: z.string().optional().describe('Content substring to locate the line.'),
+                lineContent: z.string().optional().describe('Content substring used to locate the line.'),
                 condition: z.string().optional().describe('DAP condition expression (e.g., "i > 5").'),
                 hitCondition: z.string().optional().describe('Hit-count expression (e.g., ">= 5", "% 10").'),
                 logMessage: z.string().optional().describe('Logpoint: print this message instead of pausing. Supports {expr} substitution per DAP.'),
-                allowMultiple: z.boolean().optional().describe('If true, lineContent matches on multiple lines all get breakpoints. Default false.'),
+                allowMultiple: z.boolean().optional().describe('If true and `lineContent` matches multiple lines, set breakpoints on every match. Default false.'),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleAddBreakpoint(args)));
 
         this.mcpServer!.registerTool('remove_breakpoint', {
-            description: 'Remove a breakpoint. Provide exactly one of line or lineContent.',
+            description: 'Remove a breakpoint. Provide either `line` or `lineContent` (not both).',
             inputSchema: {
-                fileFullPath: z.string().describe('Full path to the file.'),
-                line: z.number().int().positive().optional(),
-                lineContent: z.string().optional(),
+                fileFullPath: z.string().describe('Full path to the source file.'),
+                line: z.number().int().positive().optional().describe('1-based line number.'),
+                lineContent: z.string().optional().describe('Content substring used to locate the line.'),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleRemoveBreakpoint(args)));
 
         this.mcpServer!.registerTool('clear_all_breakpoints', {
-            description: 'Clear all breakpoints at once. Use this after verifying the root cause to clean up before moving on to the next task.',
+            description: 'Clear every breakpoint in every file.',
         }, this.delegate(() => this.debuggingHandler.handleClearAllBreakpoints()));
 
         this.mcpServer!.registerTool('list_breakpoints', {
-            description: 'View all currently set breakpoints across all files.',
+            description: 'List every active breakpoint with file and line.',
         }, this.delegate(() => this.debuggingHandler.handleListBreakpoints()));
 
-        this.mcpServer!.registerTool('get_variables_values', {
-            description: 'Inspect all variable values at the current execution point. This is your window into program state - see what data looks like at runtime, verify assumptions, identify unexpected values, and understand why code behaves as it does.',
+        this.mcpServer!.registerTool('get_variables', {
+            description: 'List variables in scope at the current stack frame.',
             inputSchema: {
-                scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
+                scope: z.enum(['local', 'global', 'all']).optional().describe("`local`, `global`, or `all`. Default `all`."),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleGetVariables(args)));
 
-        this.mcpServer!.registerTool('get_current_location', {
-            description: 'Read-only: return current DebugState (file, line, stack, frame). No side effects.',
-        }, this.delegate(() => this.debuggingHandler.handleGetCurrentLocation()));
-
-        this.mcpServer!.registerTool('get_stack_trace', {
-            description: 'Read-only: return the current call stack as DebugState. Same shape as step_*/continue responses.',
-        }, this.delegate(() => this.debuggingHandler.handleGetStackTrace()));
+        this.mcpServer!.registerTool('get_debug_state', {
+            description: 'Return the paused-state snapshot: file, line, frame, stack, active breakpoints.',
+        }, this.delegate(() => this.debuggingHandler.handleGetDebugState()));
 
         this.mcpServer!.registerTool('get_program_output', {
-            description: 'Read captured stdout/stderr from the debuggee program. Buffer is session-scoped and cleared on each start_debugging.',
+            description: 'Read captured stdout/stderr from the program under debug. Buffer resets on each start_debugging.',
             inputSchema: {
                 tail: z.number().int().positive().optional().describe(
                     "If set, return only the last N lines of captured output."
@@ -220,9 +198,9 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleGetProgramOutput(args)));
 
         this.mcpServer!.registerTool('evaluate_expression', {
-            description: 'Powerful runtime expression evaluator: Test hypotheses, check computed values, call methods, or inspect object properties in the live debug context. Goes beyond simple variable inspection - evaluate any valid expression in the target language.',
+            description: 'Evaluate a C++ expression in the current stack frame.',
             inputSchema: {
-                expression: z.string().describe('Expression to evaluate in the current programming language context'),
+                expression: z.string().describe('Expression to evaluate in the current frame.'),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleEvaluateExpression(args)));
     }

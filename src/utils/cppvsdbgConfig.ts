@@ -20,7 +20,7 @@ export interface StartDebuggingArgs {
     program: string;
     args?: string[];
     cwd?: string;
-    environment?: Array<{ name: string; value: string }>;
+    environment?: Record<string, string>;
     console?: ConsoleMode;
     stopAtEntry?: boolean;
     extraConfig?: Record<string, unknown>;
@@ -32,12 +32,14 @@ export function buildCppvsdbgConfig(
     args: StartDebuggingArgs,
     workspaceRoot: string,
 ): DebugConfigurationLike {
+    const envRecord = args.environment ?? {};
+    const environment = Object.entries(envRecord).map(([name, value]) => ({ name, value }));
     return {
         ...(args.extraConfig ?? {}),
         program: args.program,
         args: args.args ?? [],
         cwd: args.cwd ?? workspaceRoot,
-        environment: args.environment ?? [],
+        environment,
         console: args.console ?? "internalConsole",
         stopAtEntry: args.stopAtEntry ?? false,
         type: "cppvsdbg",

@@ -2,6 +2,18 @@
 
 export type SessionReason = "ok" | "no_session" | "not_paused";
 
+export type HandlerErrorReason =
+    | "no_session"
+    | "not_paused"
+    | "bad_input"
+    | "no_match"
+    | "multi_match"
+    | "no_workspace"
+    | "launch_rejected"
+    | "attach_failed"
+    | "debug_adapter_error"
+    | "evaluate_failed";
+
 /**
  * Minimal surface the classifier needs. Narrow interface so the util can be
  * unit-tested without a full IDebuggingExecutor mock.
@@ -16,16 +28,28 @@ export async function classifySessionState(probe: SessionProbe): Promise<Session
     return probe.hasAttachedSession() ? "not_paused" : "no_session";
 }
 
-export interface GateErrorResponse {
+export interface HandlerErrorResponse {
     isError: true;
     text: string;
-    structuredContent: { reason: Exclude<SessionReason, "ok"> };
+    structuredContent: { reason: HandlerErrorReason } & Record<string, unknown>;
 }
 
-export function gateErrorFor(reason: Exclude<SessionReason, "ok">): GateErrorResponse {
+export function gateErrorFor(reason: Exclude<SessionReason, "ok">): HandlerErrorResponse {
     const text =
         reason === "no_session"
             ? "No active debug session."
             : "Debug session is active but not paused.";
     return { isError: true, text, structuredContent: { reason } };
+}
+
+export function handlerError(
+    reason: HandlerErrorReason,
+    text: string,
+    details: Record<string, unknown> = {},
+): HandlerErrorResponse {
+    return {
+        isError: true,
+        text,
+        structuredContent: { reason, ...details },
+    };
 }

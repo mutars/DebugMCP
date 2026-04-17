@@ -6,7 +6,7 @@ import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { buildCppvsdbgConfig, StartDebuggingArgs } from './utils/cppvsdbgConfig';
-import { classifySessionState, gateErrorFor } from './utils/sessionGate';
+import { classifySessionState, gateErrorFor, handlerError } from './utils/sessionGate';
 
 export interface HandlerResponse<T = unknown> {
     text: string;
@@ -47,8 +47,7 @@ export interface IDebuggingHandler {
     handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse>;
     handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse>;
     handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse>;
-    handleGetCurrentLocation(): Promise<HandlerResponse>;
-    handleGetStackTrace(): Promise<HandlerResponse>;
+    handleGetDebugState(): Promise<HandlerResponse>;
 }
 
 export class DebuggingHandler implements IDebuggingHandler {
@@ -74,41 +73,54 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse> {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
-            throw new Error('No workspace folder open in VS Code');
+            return handlerError("no_workspace", "No workspace folder open.");
         }
         const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
         const config = buildCppvsdbgConfig(args, workspaceRoot);
-        const timeoutMs =
-            (args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS) * 1000;
+        const timeoutSeconds =
+            args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        const timeoutMs = timeoutSeconds * 1000;
 
         const started = await this.executor.startDebugging(workspaceRoot, config);
         if (!started) {
-            throw new Error('vscode.debug.startDebugging returned false');
+            return handlerError(
+                "launch_rejected",
+                "vscode.debug.startDebugging returned false.",
+            );
         }
 
         const outcome = await this.waitForSessionOutcome(timeoutMs);
-        const seconds = Math.round(timeoutMs / 1000);
 
         switch (outcome) {
             case 'paused': {
-                const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                return this.stateToEnvelope(currentState, 'Debug session started. Paused at ');
+                const state = await this.executor.getCurrentDebugState(this.numNextLines);
+                return {
+                    text: `Paused at ${state.fileName}:${state.currentLine} in ${state.frameName ?? '<unknown>'}.`,
+                    structuredContent: state.toJSON(),
+                };
             }
             case 'attached': {
-                const runningState = await this.executor.getCurrentDebugState(this.numNextLines);
-                const bps = this.formatBreakpoints();
+                const activeBreakpoints = vscode.debug.breakpoints
+                    .filter((bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint)
+                    .map((bp) => ({
+                        file: bp.location.uri.fsPath,
+                        line: bp.location.range.start.line + 1,
+                    }));
                 return {
-                    text:
-                        `Debug session started and attached, but no breakpoint hit within ${seconds}s.\n` +
-                        `The program is running. Active breakpoints:\n${bps}`,
-                    structuredContent: runningState.toJSON(),
+                    text: `Attached; running. No breakpoint hit within ${timeoutSeconds}s.`,
+                    structuredContent: {
+                        outcome: 'running',
+                        elapsedSeconds: timeoutSeconds,
+                        activeBreakpoints,
+                    },
                 };
             }
             case 'never-attached':
-                throw new Error(
-                    `Debug session failed to attach within ${seconds}s ` +
-                    `(vscode.debug.activeDebugSession never appeared)`,
+                return handlerError(
+                    "attach_failed",
+                    `Debug session never attached within ${timeoutSeconds}s.`,
+                    { timeoutSeconds },
                 );
         }
     }
@@ -116,13 +128,13 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleStopDebugging(): Promise<HandlerResponse> {
         if (!(await this.executor.hasActiveSession())) {
             return {
-                text: 'No active debug session to stop',
+                text: 'No active debug session.',
                 structuredContent: {},
             };
         }
         await this.executor.stopDebugging();
         return {
-            text: 'Debug session stopped successfully\n\n' + this.getRootCauseAnalysisCheckpointMessage(),
+            text: 'Debug session stopped.',
             structuredContent: {},
         };
     }
@@ -130,11 +142,11 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleClearAllBreakpoints(): Promise<HandlerResponse> {
         const breakpointCount = this.executor.getBreakpoints().length;
         if (breakpointCount === 0) {
-            return { text: 'No breakpoints to clear', structuredContent: { cleared: 0 } };
+            return { text: 'No breakpoints to clear.', structuredContent: { cleared: 0 } };
         }
         this.executor.clearAllBreakpoints();
         return {
-            text: `Successfully cleared ${breakpointCount} breakpoint(s)`,
+            text: `Cleared ${breakpointCount} breakpoint${breakpointCount === 1 ? '' : 's'}.`,
             structuredContent: { cleared: breakpointCount },
         };
     }
@@ -147,7 +159,11 @@ export class DebuggingHandler implements IDebuggingHandler {
         try {
             await cmd();
         } catch (error) {
-            throw new Error(`Error executing ${verb}: ${error}`);
+            return handlerError(
+                "debug_adapter_error",
+                `Error executing ${verb}: ${error}`,
+                { operation: verb, cause: String(error) },
+            );
         }
         const afterState = await this.waitForStateChange(beforeState);
         return this.stateToEnvelope(afterState);
@@ -177,11 +193,15 @@ export class DebuggingHandler implements IDebuggingHandler {
             await this.executor.restart();
             await new Promise(resolve => setTimeout(resolve, this.executionDelay));
             return {
-                text: 'Debug session restarted successfully',
+                text: 'Debug session restarted.',
                 structuredContent: {},
             };
         } catch (error) {
-            throw new Error(`Error restarting debug session: ${error}`);
+            return handlerError(
+                "debug_adapter_error",
+                `Error restarting debug session: ${error}`,
+                { operation: "restart", cause: String(error) },
+            );
         }
     }
 
@@ -332,11 +352,12 @@ export class DebuggingHandler implements IDebuggingHandler {
             };
         }
 
-        let variablesInfo = 'Variables:\n==========\n\n';
+        const frameLabel = String(activeStackItem.frameId);
+        let variablesInfo = `Variables at ${frameLabel}:\n`;
         for (const scopeItem of variablesData.scopes) {
             variablesInfo += `${scopeItem.name}:\n`;
             if (scopeItem.error) {
-                variablesInfo += `  Error retrieving variables: ${scopeItem.error}\n`;
+                variablesInfo += `  (error: ${scopeItem.error})\n`;
             } else if (scopeItem.variables && scopeItem.variables.length > 0) {
                 for (const variable of scopeItem.variables) {
                     variablesInfo += `  ${variable.name}: ${variable.value}`;
@@ -344,12 +365,12 @@ export class DebuggingHandler implements IDebuggingHandler {
                     variablesInfo += '\n';
                 }
             } else {
-                variablesInfo += '  No variables in this scope\n';
+                variablesInfo += '  (empty)\n';
             }
             variablesInfo += '\n';
         }
 
-        return { text: variablesInfo, structuredContent: variablesData };
+        return { text: variablesInfo.trimEnd(), structuredContent: variablesData };
     }
 
     public async handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse> {
@@ -363,7 +384,11 @@ export class DebuggingHandler implements IDebuggingHandler {
 
         const response = await this.executor.evaluateExpression(args.expression, activeStackItem.frameId);
         if (!response || response.result === undefined) {
-            throw new Error('Failed to evaluate expression');
+            return handlerError(
+                "evaluate_failed",
+                "Failed to evaluate expression.",
+                { expression: args.expression },
+            );
         }
 
         const textOut = `Expression: ${args.expression}\nResult: ${response.result}${response.type ? ` (${response.type})` : ''}`;
@@ -377,15 +402,11 @@ export class DebuggingHandler implements IDebuggingHandler {
         };
     }
 
-    public async handleGetCurrentLocation(): Promise<HandlerResponse> {
+    public async handleGetDebugState(): Promise<HandlerResponse> {
         const reason = await classifySessionState(this.executor);
         if (reason !== 'ok') return gateErrorFor(reason);
         const state = await this.executor.getCurrentDebugState(this.numNextLines);
         return this.stateToEnvelope(state);
-    }
-
-    public async handleGetStackTrace(): Promise<HandlerResponse> {
-        return this.handleGetCurrentLocation();
     }
 
     public async handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse> {
@@ -487,31 +508,4 @@ export class DebuggingHandler implements IDebuggingHandler {
         return false;
     }
 
-    private getRootCauseAnalysisCheckpointMessage(): string {
-        return `⚠️ **ROOT CAUSE ANALYSIS CHECKPOINT**
-
-Before concluding your debugging session:
-
-❓ **CRITICAL QUESTION:** Have you found the ROOT CAUSE or just a SYMPTOM?
-
-🔍 **If you only identified WHERE it went wrong:**
-- Variable is null/undefined
-- Function returned unexpected value
-- Error occurred at specific line
-- Condition evaluated incorrectly
-
-➡️ **You likely found a SYMPTOM - Continue debugging!**
-
-ROOT CAUSE means understanding WHY the issue occurred in the first place, for example due to:
-- Incorrect variable initialization
-- Logic error in function implementation
-- Missing error handling
-- Faulty assumptions in conditions
-
-REQUIRED NEXT STEPS:
-1. Use 'add_breakpoint' to set breakpoints at investigation points
-2. Use 'start_debugging' to trace from the beginning
-3. Investigate WHY the issue occurred, not just WHAT happened
-4. Repeat the process as necessary until the ROOT CAUSE is identified`;
-    }
 }
