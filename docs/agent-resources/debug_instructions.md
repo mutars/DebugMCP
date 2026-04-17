@@ -7,6 +7,14 @@
 4. **THEN:** Use repetitively all the other tools to navigate and inspect step by step
 5. **FINALLY:** Get to the problematic line to fully understand the root cause. If needed, restart the debug session using restart_debugging.
 
+## 🔒 SESSION LIFECYCLE CONTRACT
+
+**You own the session.** When you call `start_debugging`, you become responsible for ending it.
+
+- **One session at a time.** Calling `start_debugging` while a session is already active returns `isError` with `reason="session_active"`. Call `stop_debugging` first, then retry.
+- **Always stop when done.** Call `stop_debugging` as soon as your debug investigation is complete. Do not leave sessions paused at breakpoints when you move on.
+- **Idle auto-stop.** If no DebugMCP tool is called for 10 minutes while a session is alive, the session is auto-stopped. Your next call gets `reason="no_session"` until you start a new session.
+
 ## 🚨 ROOT CAUSE ANALYSIS - CRITICAL FRAMEWORK
 
 ### **NEVER STOP AT SYMPTOMS - ALWAYS FIND THE ROOT CAUSE**

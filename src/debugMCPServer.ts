@@ -13,8 +13,11 @@ import {
 import { HandlerResponse } from './debuggingHandler';
 import { OutputRingBuffer } from './utils/outputRingBuffer';
 import { logger } from './utils/logger';
+import { LifecycleGuard } from './utils/lifecycleGuard';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+
+const IDLE_STOP_MS = 10 * 60 * 1000;
 
 // Emits a distinctive stderr token on EADDRINUSE so wrappers can fail fast instead of
 // waiting for a readiness timeout. Writes to stderr directly because the extension host
@@ -40,6 +43,8 @@ export class DebugMCPServer {
     private initialized: boolean = false;
     private debuggingHandler: IDebuggingHandler;
     private transports: Map<string, StreamableHTTPServerTransport> = new Map();
+    private lifecycleGuard: LifecycleGuard | null = null;
+    private lifecycleDisposable: vscode.Disposable | null = null;
 
     constructor(port: number, timeoutInSeconds: number, outputBuffer?: OutputRingBuffer) {
         const executor = new DebuggingExecutor();
@@ -63,6 +68,22 @@ export class DebugMCPServer {
 
         this.setupTools();
         this.setupResources();
+
+        this.lifecycleGuard = new LifecycleGuard(IDLE_STOP_MS, async () => {
+            logger.info('[lifecycle] auto-stopping debug session after 10min idle');
+            try {
+                await vscode.debug.stopDebugging();
+            } catch (err) {
+                logger.error('[lifecycle] auto-stop failed', err);
+            }
+        });
+
+        this.lifecycleDisposable = vscode.Disposable.from(
+            vscode.debug.onDidStartDebugSession(() => this.lifecycleGuard?.arm()),
+            vscode.debug.onDidTerminateDebugSession(() => this.lifecycleGuard?.disarm()),
+            this.lifecycleGuard,
+        );
+
         this.initialized = true;
     }
 
@@ -78,10 +99,16 @@ export class DebugMCPServer {
     }
 
     private delegate<A>(fn: (a: A) => Promise<HandlerResponse>): (a: A) => Promise<ReturnType<DebugMCPServer['wrapResponse']>> {
-        return async (a: A) => this.wrapResponse(await fn(a));
+        return async (a: A) => {
+            this.lifecycleGuard?.touch();
+            return this.wrapResponse(await fn(a));
+        };
     }
 
     private setupTools() {
+        const REQUIRES_PAUSED = 'Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).';
+        const REQUIRES_ACTIVE = 'Requires an active session (otherwise `isError` with `reason="no_session"`).';
+
         this.mcpServer!.registerTool('get_debug_instructions', {
             description: 'Return the DebugMCP debugging guide: breakpoint strategies, root-cause framework, best practices.',
         }, async () => {
@@ -91,10 +118,14 @@ export class DebugMCPServer {
 
         this.mcpServer!.registerTool('start_debugging', {
             description:
-                'Launch a C++ executable under the cppvsdbg debugger. Builds a launch config from the fields below (no launch.json is read). `type` is always `cppvsdbg`, `request` always `launch`.',
+                'Launch a C++ executable under the cppvsdbg debugger. Builds a launch config from the fields below (no launch.json is read); `type` is always `cppvsdbg`, `request` always `launch`. ' +
+                'Outcomes: success returns either a paused DebugState (at a breakpoint or entry) or `structuredContent.outcome="running"` when attached without hitting a breakpoint; failure returns `isError` with `reason` in `{bad_input, launch_rejected, attach_failed, no_workspace, session_active}`. ' +
+                'While a session is active, a second call returns `isError` with `reason="session_active"` — call `stop_debugging` first. Always call `stop_debugging` when your debug investigation is complete; sessions left idle for 10 minutes are auto-stopped. ' +
+                'Every outcome resolves within `waitForBreakpointSeconds`.',
             inputSchema: {
                 program: z.string().describe(
-                    "Absolute path to the .exe, or a path using ${workspaceFolder}. Required."
+                    "Absolute path to the .exe, or a path using ${workspaceFolder}. " +
+                    "Concrete paths must exist on disk — missing paths return `bad_input` immediately. Required."
                 ),
                 args: z.array(z.string()).optional().describe(
                     "Program arguments, one argv token per array element (no shell splitting)."
@@ -118,7 +149,10 @@ export class DebugMCPServer {
                     "Additional cppvsdbg fields merged into the launch config. Use for sourceFileMap, symbolSearchPath, etc. Cannot override type, request, or name."
                 ),
                 waitForBreakpointSeconds: z.number().int().positive().optional().describe(
-                    "Max seconds to wait for a breakpoint or entry-stop before returning the attached-but-running result. Defaults to 30."
+                    "Budget for the whole launch + attach + first-break cycle. " +
+                    "If no breakpoint or entry-stop is hit within the budget, returns `outcome=\"running\"`. " +
+                    "If the debugger never attaches, returns `isError` with `reason=\"attach_failed\"`. " +
+                    "Defaults to 30."
                 ),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleStartDebugging(args)));
@@ -128,23 +162,23 @@ export class DebugMCPServer {
         }, this.delegate(() => this.debuggingHandler.handleStopDebugging()));
 
         this.mcpServer!.registerTool('step_over', {
-            description: 'Step over the current line; do not enter called functions. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
+            description: `Step over the current line; do not enter called functions. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleStepOver()));
 
         this.mcpServer!.registerTool('step_into', {
-            description: 'Step into the call on the current line; step over if none. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
+            description: `Step into the call on the current line; step over if none. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleStepInto()));
 
         this.mcpServer!.registerTool('step_out', {
-            description: 'Run until the current function returns, then pause in the caller. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`). Note: step_out from `main` ends the session — the program exits.',
+            description: `Run until the current function returns, then pause in the caller. ${REQUIRES_PAUSED} Note: step_out from \`main\` ends the session — the program exits.`,
         }, this.delegate(() => this.debuggingHandler.handleStepOut()));
 
         this.mcpServer!.registerTool('continue_execution', {
-            description: 'Resume execution until the next breakpoint or program exit. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
+            description: `Resume execution until the next breakpoint or program exit. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleContinue()));
 
         this.mcpServer!.registerTool('restart_debugging', {
-            description: 'Restart the active debug session with the same configuration. Requires an active session (otherwise `isError` with `reason="no_session"`).',
+            description: `Restart the active debug session with the same configuration. ${REQUIRES_ACTIVE}`,
         }, this.delegate(() => this.debuggingHandler.handleRestart()));
 
         this.mcpServer!.registerTool('add_breakpoint', {
@@ -178,14 +212,14 @@ export class DebugMCPServer {
         }, this.delegate(() => this.debuggingHandler.handleListBreakpoints()));
 
         this.mcpServer!.registerTool('get_variables', {
-            description: 'List variables in scope at the current stack frame. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
+            description: `List variables in scope at the current stack frame. ${REQUIRES_PAUSED}`,
             inputSchema: {
                 scope: z.enum(['local', 'global', 'all']).optional().describe("`local`, `global`, or `all`. Default `all`."),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleGetVariables(args)));
 
         this.mcpServer!.registerTool('get_debug_state', {
-            description: 'Return the paused-state snapshot: file, line, frame, stack, active breakpoints. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
+            description: `Return the paused-state snapshot: file, line, frame, stack, active breakpoints. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleGetDebugState()));
 
         this.mcpServer!.registerTool('get_program_output', {
@@ -198,7 +232,7 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleGetProgramOutput(args)));
 
         this.mcpServer!.registerTool('evaluate_expression', {
-            description: 'Evaluate a C++ expression in the current stack frame. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`). An unevaluatable expression returns `reason="evaluate_failed"`.',
+            description: `Evaluate a C++ expression in the current stack frame. ${REQUIRES_PAUSED} An unevaluatable expression returns \`reason="evaluate_failed"\`.`,
             inputSchema: {
                 expression: z.string().describe('Expression to evaluate in the current frame.'),
             },
@@ -382,6 +416,11 @@ export class DebugMCPServer {
      * Stop the MCP server
      */
     async stop() {
+        this.lifecycleDisposable?.dispose();
+        this.lifecycleDisposable = null;
+        this.lifecycleGuard = null;
+        this.initialized = false;
+
         // Note: With stateless StreamableHTTPServerTransport, transports are closed per-request
         // No need to track and close them manually
         this.transports.clear();

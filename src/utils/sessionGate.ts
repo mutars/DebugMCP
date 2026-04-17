@@ -5,6 +5,7 @@ export type SessionReason = "ok" | "no_session" | "not_paused";
 export type HandlerErrorReason =
     | "no_session"
     | "not_paused"
+    | "session_active"
     | "bad_input"
     | "no_match"
     | "multi_match"
@@ -52,4 +53,22 @@ export function handlerError(
         text,
         structuredContent: { reason, ...details },
     };
+}
+
+export function gateErrorForActive(): HandlerErrorResponse {
+    return handlerError(
+        "session_active",
+        "A debug session is already active. Call `stop_debugging` to end it before starting a new one.",
+    );
+}
+
+/**
+ * Pre-check helper for handlers that must NOT have an active session
+ * (currently only `start_debugging`). Returns `null` when clear, or the
+ * canonical error envelope when a session is already attached.
+ */
+export function requireNoActiveSession(
+    probe: { hasAttachedSession: () => boolean },
+): HandlerErrorResponse | null {
+    return probe.hasAttachedSession() ? gateErrorForActive() : null;
 }

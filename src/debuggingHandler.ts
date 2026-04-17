@@ -7,7 +7,7 @@ import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { buildCppvsdbgConfig, StartDebuggingArgs } from './utils/cppvsdbgConfig';
-import { classifySessionState, gateErrorFor, handlerError } from './utils/sessionGate';
+import { classifySessionState, gateErrorFor, handlerError, requireNoActiveSession } from './utils/sessionGate';
 
 export interface HandlerResponse<T = unknown> {
     text: string;
@@ -94,6 +94,9 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     public async handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse> {
+        const sessionGuard = requireNoActiveSession(this.executor);
+        if (sessionGuard) return sessionGuard;
+
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             return handlerError("no_workspace", "No workspace folder open.");
