@@ -15,8 +15,6 @@ export interface HandlerResponse<T = unknown> {
     isError?: boolean;
 }
 
-export type BreakpointErrorReason = 'bad_input' | 'no_match' | 'multi_match';
-
 export interface AddBreakpointArgs {
     fileFullPath: string;
     line?: number;
@@ -64,11 +62,35 @@ export class DebuggingHandler implements IDebuggingHandler {
         this.timeoutInSeconds = timeoutInSeconds;
     }
 
-    private stateToEnvelope(state: DebugState, textPrefix = ''): HandlerResponse {
+    private stateToEnvelope(state: DebugState): HandlerResponse {
         return {
-            text: textPrefix + state.toString(),
+            text: state.toString(),
             structuredContent: state.toJSON(),
         };
+    }
+
+    // Session-gate prologue shared by every paused-only handler.
+    private async requirePausedSession(): Promise<HandlerResponse | null> {
+        const reason = await classifySessionState(this.executor);
+        if (reason !== 'ok') return gateErrorFor(reason);
+        return null;
+    }
+
+    private sourceBreakpointToSummary(
+        bp: vscode.SourceBreakpoint,
+        opts: { includeModifiers?: boolean } = {},
+    ): Record<string, unknown> {
+        const line = bp.location.range.start.line + 1;
+        const base: Record<string, unknown> = {
+            file: bp.location.uri.fsPath,
+            line,
+        };
+        if (opts.includeModifiers) {
+            if (bp.condition) base.condition = bp.condition;
+            if (bp.hitCondition) base.hitCondition = bp.hitCondition;
+            if (bp.logMessage) base.logMessage = bp.logMessage;
+        }
+        return base;
     }
 
     public async handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse> {
@@ -98,18 +120,25 @@ export class DebuggingHandler implements IDebuggingHandler {
             }
         }
 
-        // Bound vscode.debug.startDebugging itself: in headless mode it can hang
-        // indefinitely on non-launchable configurations (e.g. unreadable binary)
-        // even though the pre-flight passed, so the waitForBreakpointSeconds budget
-        // must apply to this call too.
-        const launchTimeout = new Promise<'timeout'>((resolve) =>
-            setTimeout(() => resolve('timeout'), timeoutMs));
-        const launchResult: 'ok' | 'rejected' | 'timeout' = await Promise.race([
+        // One shared deadline for the whole launch+attach+first-break cycle,
+        // so the launch race and waitForSessionOutcome don't each consume the
+        // full waitForBreakpointSeconds budget.
+        const deadline = Date.now() + timeoutMs;
+
+        // Race startDebugging against the deadline — headless VS Code can hang
+        // on non-launchable configs that pre-flight can't detect (e.g. a file
+        // that exists but isn't a valid PE binary).
+        let launchTimer: ReturnType<typeof setTimeout> | undefined;
+        const launchTimeout = new Promise<'timeout'>((resolve) => {
+            launchTimer = setTimeout(() => resolve('timeout'), timeoutMs);
+        });
+        const launchResult = await Promise.race([
             this.executor.startDebugging(workspaceRoot, config).then<'ok' | 'rejected'>(
                 (ok) => (ok ? 'ok' : 'rejected'),
             ),
             launchTimeout,
         ]);
+        if (launchTimer) clearTimeout(launchTimer);
 
         if (launchResult === 'rejected') {
             return handlerError(
@@ -118,11 +147,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             );
         }
         if (launchResult === 'timeout') {
-            // Best-effort cleanup in case the session does materialise later.
-            const leftover = vscode.debug.activeDebugSession;
-            if (leftover) {
-                vscode.debug.stopDebugging(leftover).then(undefined, () => undefined);
-            }
+            this.executor.stopDebugging().catch(() => undefined);
             return handlerError(
                 "attach_failed",
                 `Launch did not complete within ${timeoutSeconds}s.`,
@@ -130,7 +155,8 @@ export class DebuggingHandler implements IDebuggingHandler {
             );
         }
 
-        const outcome = await this.waitForSessionOutcome(timeoutMs);
+        const remainingMs = Math.max(0, deadline - Date.now());
+        const outcome = await this.waitForSessionOutcome(remainingMs);
 
         switch (outcome) {
             case 'paused': {
@@ -143,10 +169,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             case 'attached': {
                 const activeBreakpoints = vscode.debug.breakpoints
                     .filter((bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint)
-                    .map((bp) => ({
-                        file: bp.location.uri.fsPath,
-                        line: bp.location.range.start.line + 1,
-                    }));
+                    .map((bp) => this.sourceBreakpointToSummary(bp));
                 return {
                     text: `Attached; running. No breakpoint hit within ${timeoutSeconds}s.`,
                     structuredContent: {
@@ -192,8 +215,8 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     private async runSteppingCommand(cmd: () => Promise<void>, verb: string): Promise<HandlerResponse> {
-        const reason = await classifySessionState(this.executor);
-        if (reason !== 'ok') return gateErrorFor(reason);
+        const gate = await this.requirePausedSession();
+        if (gate) return gate;
 
         const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
         try {
@@ -251,11 +274,7 @@ export class DebuggingHandler implements IDebuggingHandler {
         lineContent: string | undefined,
     ): Promise<number[] | HandlerResponse> {
         if ((line === undefined) === (lineContent === undefined)) {
-            return {
-                isError: true,
-                text: "Provide exactly one of 'line' or 'lineContent'.",
-                structuredContent: { reason: 'bad_input' as BreakpointErrorReason },
-            };
+            return handlerError("bad_input", "Provide exactly one of 'line' or 'lineContent'.");
         }
         if (line !== undefined) return [line];
 
@@ -276,18 +295,14 @@ export class DebuggingHandler implements IDebuggingHandler {
 
         if (lineContent !== undefined) {
             if (targetLines.length === 0) {
-                return {
-                    isError: true,
-                    text: `No lines in ${fileFullPath} contain: ${lineContent}`,
-                    structuredContent: { reason: 'no_match' as BreakpointErrorReason },
-                };
+                return handlerError("no_match", `No lines in ${fileFullPath} contain: ${lineContent}`);
             }
             if (targetLines.length > 1 && !allowMultiple) {
-                return {
-                    isError: true,
-                    text: `lineContent matched ${targetLines.length} lines; pass allowMultiple=true to accept.`,
-                    structuredContent: { reason: 'multi_match' as BreakpointErrorReason, matchedLines: targetLines },
-                };
+                return handlerError(
+                    "multi_match",
+                    `lineContent matched ${targetLines.length} lines; pass allowMultiple=true to accept.`,
+                    { matchedLines: targetLines },
+                );
             }
         }
 
@@ -299,9 +314,9 @@ export class DebuggingHandler implements IDebuggingHandler {
             ...(hitCondition ? { hitCondition } : {}),
             ...(logMessage ? { logMessage } : {}),
         }));
-        for (const ln of targetLines) {
-            await this.executor.addBreakpoint(uri, ln, { condition, hitCondition, logMessage });
-        }
+        await Promise.all(targetLines.map((ln) =>
+            this.executor.addBreakpoint(uri, ln, { condition, hitCondition, logMessage }),
+        ));
 
         const textOut = set.length === 1
             ? `Breakpoint added at ${fileFullPath}:${targetLines[0]}`
@@ -327,11 +342,11 @@ export class DebuggingHandler implements IDebuggingHandler {
         );
 
         if (toRemove.length === 0) {
-            return {
-                isError: true,
-                text: `No matching breakpoint found in ${fileFullPath}.`,
-                structuredContent: { reason: 'no_match' as BreakpointErrorReason, removed: 0 },
-            };
+            return handlerError(
+                "no_match",
+                `No matching breakpoint found in ${fileFullPath}.`,
+                { removed: 0 },
+            );
         }
 
         vscode.debug.removeBreakpoints(toRemove);
@@ -357,13 +372,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 const fileName = path.basename(bp.location.uri.fsPath);
                 const line = bp.location.range.start.line + 1;
                 textOut += `${index + 1}. ${fileName}:${line}\n`;
-                structured.push({
-                    file: bp.location.uri.fsPath,
-                    line,
-                    ...(bp.condition ? { condition: bp.condition } : {}),
-                    ...(bp.hitCondition ? { hitCondition: bp.hitCondition } : {}),
-                    ...(bp.logMessage ? { logMessage: bp.logMessage } : {}),
-                });
+                structured.push(this.sourceBreakpointToSummary(bp, { includeModifiers: true }));
             } else if (bp instanceof vscode.FunctionBreakpoint) {
                 textOut += `${index + 1}. Function: ${bp.functionName}\n`;
                 structured.push({ functionName: bp.functionName });
@@ -375,8 +384,8 @@ export class DebuggingHandler implements IDebuggingHandler {
 
     public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse> {
         const { scope = 'all' } = args;
-        const reason = await classifySessionState(this.executor);
-        if (reason !== 'ok') return gateErrorFor(reason);
+        const gate = await this.requirePausedSession();
+        if (gate) return gate;
 
         const activeStackItem = vscode.debug.activeStackItem;
         if (!activeStackItem || !('frameId' in activeStackItem)) {
@@ -414,8 +423,8 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     public async handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse> {
-        const reason = await classifySessionState(this.executor);
-        if (reason !== 'ok') return gateErrorFor(reason);
+        const gate = await this.requirePausedSession();
+        if (gate) return gate;
 
         const activeStackItem = vscode.debug.activeStackItem;
         if (!activeStackItem || !('frameId' in activeStackItem)) {
@@ -443,8 +452,8 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     public async handleGetDebugState(): Promise<HandlerResponse> {
-        const reason = await classifySessionState(this.executor);
-        if (reason !== 'ok') return gateErrorFor(reason);
+        const gate = await this.requirePausedSession();
+        if (gate) return gate;
         const state = await this.executor.getCurrentDebugState(this.numNextLines);
         return this.stateToEnvelope(state);
     }
@@ -490,21 +499,8 @@ export class DebuggingHandler implements IDebuggingHandler {
         return this.executor.hasAttachedSession() ? 'attached' : 'never-attached';
     }
 
-    private formatBreakpoints(): string {
-        const sourceBps = vscode.debug.breakpoints.filter(
-            (bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint,
-        );
-        if (sourceBps.length === 0) {
-            return '  (No breakpoints set)';
-        }
-        return sourceBps
-            .map((bp) => `  - ${bp.location.uri.fsPath}:${bp.location.range.start.line + 1}`)
-            .join('\n');
-    }
-
     private async waitForStateChange(beforeState: DebugState): Promise<DebugState> {
-        const baseDelay = 1000;
-        const maxDelay = 1000;
+        const pollMs = 1000;
         const startTime = Date.now();
         let attempt = 0;
 
@@ -520,11 +516,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             }
 
             logger.info(`[Attempt ${attempt + 1}] Waiting for debugger state to change...`);
-
-            const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
-            const jitteredDelay = delay + Math.random() * 200;
-
-            await new Promise(resolve => setTimeout(resolve, jitteredDelay));
+            await new Promise((resolve) => setTimeout(resolve, pollMs + Math.random() * 200));
             attempt++;
         }
 

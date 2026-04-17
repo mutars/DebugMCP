@@ -39,7 +39,7 @@ export function gateErrorFor(reason: Exclude<SessionReason, "ok">): HandlerError
         reason === "no_session"
             ? "No active debug session."
             : "Debug session is active but not paused.";
-    return { isError: true, text, structuredContent: { reason } };
+    return handlerError(reason, text);
 }
 
 export function handlerError(
