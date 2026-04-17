@@ -128,27 +128,27 @@ export class DebugMCPServer {
         }, this.delegate(() => this.debuggingHandler.handleStopDebugging()));
 
         this.mcpServer!.registerTool('step_over', {
-            description: 'Step over the current line; do not enter called functions.',
+            description: 'Step over the current line; do not enter called functions. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
         }, this.delegate(() => this.debuggingHandler.handleStepOver()));
 
         this.mcpServer!.registerTool('step_into', {
-            description: 'Step into the call on the current line; step over if none.',
+            description: 'Step into the call on the current line; step over if none. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
         }, this.delegate(() => this.debuggingHandler.handleStepInto()));
 
         this.mcpServer!.registerTool('step_out', {
-            description: 'Run until the current function returns, then pause in the caller.',
+            description: 'Run until the current function returns, then pause in the caller. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`). Note: step_out from `main` ends the session — the program exits.',
         }, this.delegate(() => this.debuggingHandler.handleStepOut()));
 
         this.mcpServer!.registerTool('continue_execution', {
-            description: 'Resume execution until the next breakpoint or program exit.',
+            description: 'Resume execution until the next breakpoint or program exit. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
         }, this.delegate(() => this.debuggingHandler.handleContinue()));
 
         this.mcpServer!.registerTool('restart_debugging', {
-            description: 'Restart the active debug session with the same configuration.',
+            description: 'Restart the active debug session with the same configuration. Requires an active session (otherwise `isError` with `reason="no_session"`).',
         }, this.delegate(() => this.debuggingHandler.handleRestart()));
 
         this.mcpServer!.registerTool('add_breakpoint', {
-            description: 'Set a breakpoint. Provide either `line` or `lineContent` (not both). If `lineContent` matches multiple lines, set `allowMultiple` to accept all matches.',
+            description: 'Set a breakpoint. Provide either `line` or `lineContent` (not both). If `lineContent` matches multiple lines, set `allowMultiple` to accept all matches. Failure returns `isError` with `reason` in `{bad_input, no_match, multi_match}`. Breakpoints persist across sessions.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the source file.'),
                 line: z.number().int().positive().optional().describe('1-based line number.'),
@@ -161,7 +161,7 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleAddBreakpoint(args)));
 
         this.mcpServer!.registerTool('remove_breakpoint', {
-            description: 'Remove a breakpoint. Provide either `line` or `lineContent` (not both).',
+            description: 'Remove a breakpoint. Provide either `line` or `lineContent` (not both). Failure returns `isError` with `reason` in `{bad_input, no_match}`.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the source file.'),
                 line: z.number().int().positive().optional().describe('1-based line number.'),
@@ -178,14 +178,14 @@ export class DebugMCPServer {
         }, this.delegate(() => this.debuggingHandler.handleListBreakpoints()));
 
         this.mcpServer!.registerTool('get_variables', {
-            description: 'List variables in scope at the current stack frame.',
+            description: 'List variables in scope at the current stack frame. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
             inputSchema: {
                 scope: z.enum(['local', 'global', 'all']).optional().describe("`local`, `global`, or `all`. Default `all`."),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleGetVariables(args)));
 
         this.mcpServer!.registerTool('get_debug_state', {
-            description: 'Return the paused-state snapshot: file, line, frame, stack, active breakpoints.',
+            description: 'Return the paused-state snapshot: file, line, frame, stack, active breakpoints. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).',
         }, this.delegate(() => this.debuggingHandler.handleGetDebugState()));
 
         this.mcpServer!.registerTool('get_program_output', {
@@ -198,7 +198,7 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleGetProgramOutput(args)));
 
         this.mcpServer!.registerTool('evaluate_expression', {
-            description: 'Evaluate a C++ expression in the current stack frame.',
+            description: 'Evaluate a C++ expression in the current stack frame. Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`). An unevaluatable expression returns `reason="evaluate_failed"`.',
             inputSchema: {
                 expression: z.string().describe('Expression to evaluate in the current frame.'),
             },

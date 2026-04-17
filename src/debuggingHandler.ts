@@ -2,6 +2,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
@@ -82,11 +83,50 @@ export class DebuggingHandler implements IDebuggingHandler {
             args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
         const timeoutMs = timeoutSeconds * 1000;
 
-        const started = await this.executor.startDebugging(workspaceRoot, config);
-        if (!started) {
+        // Pre-flight: catch the common typo case before the debugger hangs.
+        // Skip when the path contains a variable reference — those are resolved
+        // later by VS Code's variable substitution layer.
+        if (!args.program.includes('${')) {
+            try {
+                await fs.promises.access(args.program, fs.constants.F_OK);
+            } catch {
+                return handlerError(
+                    "bad_input",
+                    `Program not found: ${args.program}`,
+                    { program: args.program },
+                );
+            }
+        }
+
+        // Bound vscode.debug.startDebugging itself: in headless mode it can hang
+        // indefinitely on non-launchable configurations (e.g. unreadable binary)
+        // even though the pre-flight passed, so the waitForBreakpointSeconds budget
+        // must apply to this call too.
+        const launchTimeout = new Promise<'timeout'>((resolve) =>
+            setTimeout(() => resolve('timeout'), timeoutMs));
+        const launchResult: 'ok' | 'rejected' | 'timeout' = await Promise.race([
+            this.executor.startDebugging(workspaceRoot, config).then<'ok' | 'rejected'>(
+                (ok) => (ok ? 'ok' : 'rejected'),
+            ),
+            launchTimeout,
+        ]);
+
+        if (launchResult === 'rejected') {
             return handlerError(
                 "launch_rejected",
                 "vscode.debug.startDebugging returned false.",
+            );
+        }
+        if (launchResult === 'timeout') {
+            // Best-effort cleanup in case the session does materialise later.
+            const leftover = vscode.debug.activeDebugSession;
+            if (leftover) {
+                vscode.debug.stopDebugging(leftover).then(undefined, () => undefined);
+            }
+            return handlerError(
+                "attach_failed",
+                `Launch did not complete within ${timeoutSeconds}s.`,
+                { timeoutSeconds },
             );
         }
 
