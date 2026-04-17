@@ -158,8 +158,17 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleStartDebugging(args)));
 
         this.mcpServer!.registerTool('stop_debugging', {
-            description: 'End the active debug session.',
-        }, this.delegate(() => this.debuggingHandler.handleStopDebugging()));
+            description:
+                'End the active debug session. By default terminates the debuggee process ' +
+                '(equivalent to the VS Code Stop button). Pass `terminate: false` to detach ' +
+                'the debugger without killing the process (equivalent to Debug: Disconnect).',
+            inputSchema: {
+                terminate: z.boolean().optional().describe(
+                    'If true (default), terminate the debuggee process after stopping the debug session. ' +
+                    'If false, detach the debugger and leave the process running.',
+                ),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleStopDebugging(args)));
 
         this.mcpServer!.registerTool('step_over', {
             description: `Step over the current line; do not enter called functions. ${REQUIRES_PAUSED}`,

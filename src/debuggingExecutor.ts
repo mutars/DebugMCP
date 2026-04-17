@@ -15,7 +15,7 @@ export interface BreakpointOptions {
  */
 export interface IDebuggingExecutor {
     startDebugging(workingDirectory: string, config: vscode.DebugConfiguration): Promise<boolean>;
-    stopDebugging(session?: vscode.DebugSession): Promise<void>;
+    stopDebugging(session?: vscode.DebugSession, opts?: { terminate?: boolean }): Promise<void>;
     stepOver(): Promise<void>;
     stepInto(): Promise<void>;
     stepOut(): Promise<void>;
@@ -72,14 +72,21 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Stop the debugging session
+     * Stop the debugging session.
+     *
+     * Uses the same VS Code commands the UI Stop/Disconnect buttons invoke so
+     * behavior matches what users see when clicking those buttons — including
+     * the parent-session walk that `vscode.debug.stopDebugging()` skips.
      */
-    public async stopDebugging(session?: vscode.DebugSession): Promise<void> {
+    public async stopDebugging(
+        _session?: vscode.DebugSession,
+        opts: { terminate?: boolean } = {},
+    ): Promise<void> {
+        const terminate = opts.terminate ?? true;
         try {
-            const activeSession = session || vscode.debug.activeDebugSession;
-            if (activeSession) {
-                await vscode.debug.stopDebugging(activeSession);
-            }
+            await vscode.commands.executeCommand(
+                terminate ? 'workbench.action.debug.stop' : 'workbench.action.debug.disconnect',
+            );
         } catch (error) {
             throw new Error(`Failed to stop debugging: ${error}`);
         }

@@ -12,7 +12,7 @@
 **You own the session.** When you call `start_debugging`, you become responsible for ending it.
 
 - **One session at a time.** Calling `start_debugging` while a session is already active returns `isError` with `reason="session_active"`. Call `stop_debugging` first, then retry.
-- **Always stop when done.** Call `stop_debugging` as soon as your debug investigation is complete. Do not leave sessions paused at breakpoints when you move on.
+- **Always stop when done.** Call `stop_debugging` as soon as your debug investigation is complete. Do not leave sessions paused at breakpoints when you move on. By default this terminates the debuggee process; pass `terminate: false` only when you explicitly want to detach and leave the process running.
 - **Idle auto-stop.** If no DebugMCP tool is called for 10 minutes while a session is alive, the session is auto-stopped. Your next call gets `reason="no_session"` until you start a new session.
 
 ## 🚨 ROOT CAUSE ANALYSIS - CRITICAL FRAMEWORK

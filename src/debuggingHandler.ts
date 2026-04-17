@@ -33,7 +33,7 @@ export interface RemoveBreakpointArgs {
 
 export interface IDebuggingHandler {
     handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse>;
-    handleStopDebugging(): Promise<HandlerResponse>;
+    handleStopDebugging(args?: { terminate?: boolean }): Promise<HandlerResponse>;
     handleStepOver(args?: { steps?: number }): Promise<HandlerResponse>;
     handleStepInto(): Promise<HandlerResponse>;
     handleStepOut(): Promise<HandlerResponse>;
@@ -191,16 +191,21 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
     }
 
-    public async handleStopDebugging(): Promise<HandlerResponse> {
-        if (!(await this.executor.hasActiveSession())) {
+    public async handleStopDebugging(
+        args: { terminate?: boolean } = {},
+    ): Promise<HandlerResponse> {
+        const terminate = args.terminate ?? true;
+        if (!this.executor.hasAttachedSession()) {
             return {
                 text: 'No active debug session.',
                 structuredContent: {},
             };
         }
-        await this.executor.stopDebugging();
+        await this.executor.stopDebugging(undefined, { terminate });
         return {
-            text: 'Debug session stopped.',
+            text: terminate
+                ? 'Debug session stopped; process terminated.'
+                : 'Debug session disconnected; process left running.',
             structuredContent: {},
         };
     }
