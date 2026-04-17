@@ -80,7 +80,7 @@
         "debugmcp.headless": {
           "type": "boolean",
           "default": false,
-          "description": "When true, suppress interactive UX (agent-selection popup, info/error toasts, SSE\u2192streamableHttp migration prompt). Intended for headless/embedded use where the extension is driven by an automated wrapper."
+          "description": "When true, suppress interactive UX (agent-selection popup, info/error toasts, SSE→streamableHttp migration prompt). Intended for headless/embedded use where the extension is driven by an automated wrapper."
         }
       }
     }
@@ -97,6 +97,7 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@types/express": "^5.0.3",
     "express": "^5.2.1",
+    "headless-debug-cpp": "file:../..",
     "zod": "^3.25.76"
   },
   "devDependencies": {
