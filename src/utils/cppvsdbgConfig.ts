@@ -27,6 +27,24 @@ export interface StartDebuggingArgs {
     waitForBreakpointSeconds?: number;
 }
 
+export interface AttachDebuggingArgs {
+    processId: number;
+    extraConfig?: Record<string, unknown>;
+    waitForBreakpointSeconds?: number;
+}
+
+export function buildCppvsdbgAttachConfig(
+    args: AttachDebuggingArgs,
+): DebugConfigurationLike {
+    return {
+        ...(args.extraConfig ?? {}),
+        processId: args.processId,
+        type: "cppvsdbg",
+        request: "attach",
+        name: `DebugMCP: Attach to PID ${args.processId}`,
+    };
+}
+
 // Merge order (later wins): extraConfig → explicit fields + defaults → hardcoded type/request/name.
 export function buildCppvsdbgConfig(
     args: StartDebuggingArgs,

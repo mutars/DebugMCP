@@ -10,12 +10,20 @@ export interface BreakpointOptions {
     logMessage?: string;
 }
 
+export interface InstructionBreakpointEntry {
+    address: string;
+    condition?: string;
+    hitCondition?: string;
+    logMessage?: string;
+}
+
 /**
  * Interface for debugging execution operations
  */
 export interface IDebuggingExecutor {
     startDebugging(workingDirectory: string, config: vscode.DebugConfiguration): Promise<boolean>;
     stopDebugging(session?: vscode.DebugSession, opts?: { terminate?: boolean }): Promise<void>;
+    pause(): Promise<void>;
     stepOver(): Promise<void>;
     stepInto(): Promise<void>;
     stepOut(): Promise<void>;
@@ -28,6 +36,10 @@ export interface IDebuggingExecutor {
     evaluateExpression(expression: string, frameId: number): Promise<any>;
     getBreakpoints(): readonly vscode.Breakpoint[];
     clearAllBreakpoints(): void;
+    addInstructionBreakpoint(address: string, opts?: BreakpointOptions): Promise<void>;
+    removeInstructionBreakpoint(address: string): Promise<void>;
+    clearInstructionBreakpoints(): Promise<void>;
+    getInstructionBreakpoints(): ReadonlyMap<string, InstructionBreakpointEntry>;
     hasActiveSession(): Promise<boolean>;
     hasAttachedSession(): boolean;
     getActiveSession(): vscode.DebugSession | undefined;
@@ -40,6 +52,7 @@ export interface IDebuggingExecutor {
  */
 export class DebuggingExecutor implements IDebuggingExecutor {
     private outputBuffer: OutputRingBuffer | null = null;
+    private readonly instrBreakpoints = new Map<string, InstructionBreakpointEntry>();
 
     public setOutputBuffer(buffer: OutputRingBuffer): void {
         this.outputBuffer = buffer;
@@ -89,6 +102,17 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             );
         } catch (error) {
             throw new Error(`Failed to stop debugging: ${error}`);
+        }
+    }
+
+    /**
+     * Pause (break all) the running debuggee
+     */
+    public async pause(): Promise<void> {
+        try {
+            await vscode.commands.executeCommand('workbench.action.debug.pause');
+        } catch (error) {
+            throw new Error(`Failed to pause: ${error}`);
         }
     }
 
@@ -357,6 +381,55 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         }
     }
 
+
+    private normalizeAddress(address: string): string {
+        const stripped = address.replace(/^0x/i, '');
+        return '0x' + stripped.toUpperCase();
+    }
+
+    private async syncInstructionBreakpoints(): Promise<void> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session for instruction breakpoints');
+        }
+        const breakpoints = Array.from(this.instrBreakpoints.values()).map((entry) => {
+            const bp: Record<string, unknown> = { instructionReference: entry.address };
+            if (entry.condition) bp.condition = entry.condition;
+            if (entry.hitCondition) bp.hitCondition = entry.hitCondition;
+            return bp;
+        });
+        await session.customRequest('setInstructionBreakpoints', { breakpoints });
+    }
+
+    public async addInstructionBreakpoint(address: string, opts: BreakpointOptions = {}): Promise<void> {
+        const normalized = this.normalizeAddress(address);
+        this.instrBreakpoints.set(normalized, {
+            address: normalized,
+            condition: opts.condition,
+            hitCondition: opts.hitCondition,
+            logMessage: opts.logMessage,
+        });
+        await this.syncInstructionBreakpoints();
+    }
+
+    public async removeInstructionBreakpoint(address: string): Promise<void> {
+        const normalized = this.normalizeAddress(address);
+        if (!this.instrBreakpoints.delete(normalized)) {
+            throw new Error(`No instruction breakpoint at ${normalized}`);
+        }
+        await this.syncInstructionBreakpoints();
+    }
+
+    public async clearInstructionBreakpoints(): Promise<void> {
+        this.instrBreakpoints.clear();
+        if (vscode.debug.activeDebugSession) {
+            await this.syncInstructionBreakpoints();
+        }
+    }
+
+    public getInstructionBreakpoints(): ReadonlyMap<string, InstructionBreakpointEntry> {
+        return this.instrBreakpoints;
+    }
 
     /**
      * Get all active breakpoints

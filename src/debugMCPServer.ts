@@ -170,6 +170,10 @@ export class DebugMCPServer {
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleStopDebugging(args)));
 
+        this.mcpServer!.registerTool('pause_execution', {
+            description: `Pause (break all) a running debuggee. ${REQUIRES_ACTIVE} Returns a DebugState snapshot once paused.`,
+        }, this.delegate(() => this.debuggingHandler.handlePause()));
+
         this.mcpServer!.registerTool('step_over', {
             description: `Step over the current line; do not enter called functions. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleStepOver()));
@@ -213,7 +217,7 @@ export class DebugMCPServer {
         }, this.delegate((args: any) => this.debuggingHandler.handleRemoveBreakpoint(args)));
 
         this.mcpServer!.registerTool('clear_all_breakpoints', {
-            description: 'Clear every breakpoint in every file.',
+            description: 'Clear every breakpoint — source breakpoints in all files and address (instruction) breakpoints.',
         }, this.delegate(() => this.debuggingHandler.handleClearAllBreakpoints()));
 
         this.mcpServer!.registerTool('list_breakpoints', {
@@ -246,6 +250,58 @@ export class DebugMCPServer {
                 expression: z.string().describe('Expression to evaluate in the current frame.'),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleEvaluateExpression(args)));
+
+        this.mcpServer!.registerTool('attach_to_process', {
+            description:
+                'Attach the cppvsdbg debugger to a running process. Provide either `processId` (PID) or `processName` (resolved to PID). ' +
+                'Outcomes mirror `start_debugging`: success returns a paused DebugState or `outcome="running"`; failure returns `isError` with `reason`. ' +
+                'While a session is active, returns `reason="session_active"` — call `stop_debugging` first.',
+            inputSchema: {
+                processId: z.number().int().positive().optional().describe(
+                    'PID of the process to attach to. One of processId or processName is required.',
+                ),
+                processName: z.string().optional().describe(
+                    'Name of the process (e.g., "FlatOut.exe"). Resolved to PID; fails if multiple processes match.',
+                ),
+                extraConfig: z.record(z.unknown()).optional().describe(
+                    'Additional cppvsdbg fields merged into the attach config.',
+                ),
+                waitForBreakpointSeconds: z.number().int().positive().optional().describe(
+                    'Timeout for the attach cycle. Defaults to 30.',
+                ),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleAttachToProcess(args)));
+
+        this.mcpServer!.registerTool('add_address_breakpoint', {
+            description:
+                `Set a breakpoint at a raw memory address (instruction breakpoint). ` +
+                `Address is a hex string (e.g., "0x00401000" or "401000"). ${REQUIRES_ACTIVE} ` +
+                `Unlike source breakpoints, address breakpoints do not persist across sessions.`,
+            inputSchema: {
+                address: z.string().describe('Hex address, e.g. "0x00401000" or "401000".'),
+                condition: z.string().optional().describe('DAP condition expression (e.g., "eax == 0").'),
+                hitCondition: z.string().optional().describe('Hit-count expression (e.g., ">= 5").'),
+                logMessage: z.string().optional().describe('Logpoint message. Supports {expr} substitution.'),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleAddAddressBreakpoint(args)));
+
+        this.mcpServer!.registerTool('remove_address_breakpoint', {
+            description: `Remove an instruction breakpoint at the given address. ${REQUIRES_ACTIVE}`,
+            inputSchema: {
+                address: z.string().describe('Hex address to remove (e.g., "0x00401000").'),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleRemoveAddressBreakpoint(args)));
+
+        this.mcpServer!.registerTool('list_processes', {
+            description:
+                'List running processes with PID and name. No debug session required. ' +
+                'Use `filter` to narrow results by process name substring.',
+            inputSchema: {
+                filter: z.string().optional().describe(
+                    'Case-insensitive substring filter on process name.',
+                ),
+            },
+        }, this.delegate((args: any) => this.debuggingHandler.handleListProcesses(args)));
     }
 
     /**

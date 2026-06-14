@@ -6,8 +6,9 @@ import * as fs from 'fs';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
-import { buildCppvsdbgConfig, StartDebuggingArgs } from './utils/cppvsdbgConfig';
+import { buildCppvsdbgConfig, buildCppvsdbgAttachConfig, StartDebuggingArgs, AttachDebuggingArgs } from './utils/cppvsdbgConfig';
 import { classifySessionState, gateErrorFor, handlerError, requireNoActiveSession } from './utils/sessionGate';
+import { enumerateProcesses, findProcessByName } from './utils/processEnum';
 
 export interface HandlerResponse<T = unknown> {
     text: string;
@@ -31,9 +32,29 @@ export interface RemoveBreakpointArgs {
     lineContent?: string;
 }
 
+export interface AddressBreakpointArgs {
+    address: string;
+    condition?: string;
+    hitCondition?: string;
+    logMessage?: string;
+}
+
+export interface AttachToProcessArgs {
+    processId?: number;
+    processName?: string;
+    extraConfig?: Record<string, unknown>;
+    waitForBreakpointSeconds?: number;
+}
+
+export interface ListProcessesArgs {
+    filter?: string;
+}
+
 export interface IDebuggingHandler {
     handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse>;
+    handleAttachToProcess(args: AttachToProcessArgs): Promise<HandlerResponse>;
     handleStopDebugging(args?: { terminate?: boolean }): Promise<HandlerResponse>;
+    handlePause(): Promise<HandlerResponse>;
     handleStepOver(args?: { steps?: number }): Promise<HandlerResponse>;
     handleStepInto(): Promise<HandlerResponse>;
     handleStepOut(): Promise<HandlerResponse>;
@@ -41,8 +62,11 @@ export interface IDebuggingHandler {
     handleRestart(): Promise<HandlerResponse>;
     handleAddBreakpoint(args: AddBreakpointArgs): Promise<HandlerResponse>;
     handleRemoveBreakpoint(args: RemoveBreakpointArgs): Promise<HandlerResponse>;
+    handleAddAddressBreakpoint(args: AddressBreakpointArgs): Promise<HandlerResponse>;
+    handleRemoveAddressBreakpoint(args: { address: string }): Promise<HandlerResponse>;
     handleClearAllBreakpoints(): Promise<HandlerResponse>;
     handleListBreakpoints(): Promise<HandlerResponse>;
+    handleListProcesses(args: ListProcessesArgs): Promise<HandlerResponse>;
     handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse>;
     handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse>;
     handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse>;
@@ -191,6 +215,97 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
     }
 
+    public async handleAttachToProcess(args: AttachToProcessArgs): Promise<HandlerResponse> {
+        const sessionGuard = requireNoActiveSession(this.executor);
+        if (sessionGuard) return sessionGuard;
+
+        if (args.processId === undefined && args.processName === undefined) {
+            return handlerError("bad_input", "Provide either processId or processName.");
+        }
+
+        let pid: number;
+        if (args.processId !== undefined) {
+            pid = args.processId;
+        } else {
+            const matches = findProcessByName(args.processName!);
+            if (matches.length === 0) {
+                return handlerError("bad_input", `No process found matching "${args.processName}".`);
+            }
+            if (matches.length > 1) {
+                return handlerError(
+                    "bad_input",
+                    `Multiple processes match "${args.processName}": ${matches.map((p) => `${p.name} (PID ${p.pid})`).join(', ')}. Specify processId instead.`,
+                    { matches },
+                );
+            }
+            pid = matches[0].pid;
+        }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            return handlerError("no_workspace", "No workspace folder open.");
+        }
+        const workspaceRoot = workspaceFolders[0].uri.fsPath;
+
+        const config = buildCppvsdbgAttachConfig({
+            processId: pid,
+            extraConfig: args.extraConfig,
+        });
+        const timeoutSeconds =
+            args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        const timeoutMs = timeoutSeconds * 1000;
+        const deadline = Date.now() + timeoutMs;
+
+        let launchTimer: ReturnType<typeof setTimeout> | undefined;
+        const launchTimeout = new Promise<'timeout'>((resolve) => {
+            launchTimer = setTimeout(() => resolve('timeout'), timeoutMs);
+        });
+        const launchResult = await Promise.race([
+            this.executor.startDebugging(workspaceRoot, config).then<'ok' | 'rejected'>(
+                (ok) => (ok ? 'ok' : 'rejected'),
+            ),
+            launchTimeout,
+        ]);
+        if (launchTimer) clearTimeout(launchTimer);
+
+        if (launchResult === 'rejected') {
+            return handlerError("launch_rejected", `Failed to attach to PID ${pid}.`);
+        }
+        if (launchResult === 'timeout') {
+            this.executor.stopDebugging().catch(() => undefined);
+            return handlerError(
+                "attach_failed",
+                `Attach to PID ${pid} did not complete within ${timeoutSeconds}s.`,
+                { timeoutSeconds, processId: pid },
+            );
+        }
+
+        const remainingMs = Math.max(0, deadline - Date.now());
+        const outcome = await this.waitForSessionOutcome(remainingMs);
+
+        switch (outcome) {
+            case 'paused': {
+                const state = await this.executor.getCurrentDebugState(this.numNextLines);
+                return {
+                    text: `Attached to PID ${pid}, paused at ${state.fileName}:${state.currentLine}.`,
+                    structuredContent: state.toJSON(),
+                };
+            }
+            case 'attached': {
+                return {
+                    text: `Attached to PID ${pid}; running. Use add_breakpoint or add_address_breakpoint then continue_execution to pause.`,
+                    structuredContent: { outcome: 'running', processId: pid },
+                };
+            }
+            case 'never-attached':
+                return handlerError(
+                    "attach_failed",
+                    `Debug session never attached to PID ${pid} within ${timeoutSeconds}s.`,
+                    { timeoutSeconds, processId: pid },
+                );
+        }
+    }
+
     public async handleStopDebugging(
         args: { terminate?: boolean } = {},
     ): Promise<HandlerResponse> {
@@ -212,13 +327,18 @@ export class DebuggingHandler implements IDebuggingHandler {
 
     public async handleClearAllBreakpoints(): Promise<HandlerResponse> {
         const breakpointCount = this.executor.getBreakpoints().length;
-        if (breakpointCount === 0) {
+        const instrCount = this.executor.getInstructionBreakpoints().size;
+        const total = breakpointCount + instrCount;
+        if (total === 0) {
             return { text: 'No breakpoints to clear.', structuredContent: { cleared: 0 } };
         }
         this.executor.clearAllBreakpoints();
+        if (instrCount > 0) {
+            await this.executor.clearInstructionBreakpoints();
+        }
         return {
-            text: `Cleared ${breakpointCount} breakpoint${breakpointCount === 1 ? '' : 's'}.`,
-            structuredContent: { cleared: breakpointCount },
+            text: `Cleared ${total} breakpoint${total === 1 ? '' : 's'} (${breakpointCount} source, ${instrCount} address).`,
+            structuredContent: { cleared: total, source: breakpointCount, address: instrCount },
         };
     }
 
@@ -238,6 +358,24 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
         const afterState = await this.waitForStateChange(beforeState);
         return this.stateToEnvelope(afterState);
+    }
+
+    public async handlePause(): Promise<HandlerResponse> {
+        if (!this.executor.hasAttachedSession()) {
+            return handlerError("no_session", "No active debug session.");
+        }
+        try {
+            await this.executor.pause();
+        } catch (error) {
+            return handlerError(
+                "debug_adapter_error",
+                `Failed to pause: ${error}`,
+                { operation: "pause", cause: String(error) },
+            );
+        }
+        await new Promise(resolve => setTimeout(resolve, this.executionDelay));
+        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        return this.stateToEnvelope(state);
     }
 
     public async handleStepOver(_args?: { steps?: number }): Promise<HandlerResponse> {
@@ -364,30 +502,118 @@ export class DebuggingHandler implements IDebuggingHandler {
         };
     }
 
+    public async handleAddAddressBreakpoint(args: AddressBreakpointArgs): Promise<HandlerResponse> {
+        if (!this.executor.hasAttachedSession()) {
+            return handlerError("no_session", "No active debug session. Attach or launch first.");
+        }
+
+        if (!/^(0x)?[0-9a-fA-F]+$/.test(args.address)) {
+            return handlerError("bad_input", `Invalid hex address: ${args.address}`);
+        }
+
+        try {
+            await this.executor.addInstructionBreakpoint(args.address, {
+                condition: args.condition,
+                hitCondition: args.hitCondition,
+                logMessage: args.logMessage,
+            });
+        } catch (error) {
+            return handlerError(
+                "debug_adapter_error",
+                `Failed to set instruction breakpoint at ${args.address}: ${error}`,
+                { address: args.address, cause: String(error) },
+            );
+        }
+
+        const normalized = args.address.replace(/^0x/i, '');
+        const display = '0x' + normalized.toUpperCase();
+        return {
+            text: `Address breakpoint set at ${display}.`,
+            structuredContent: { address: display },
+        };
+    }
+
+    public async handleRemoveAddressBreakpoint(args: { address: string }): Promise<HandlerResponse> {
+        if (!this.executor.hasAttachedSession()) {
+            return handlerError("no_session", "No active debug session.");
+        }
+
+        try {
+            await this.executor.removeInstructionBreakpoint(args.address);
+        } catch (error) {
+            return handlerError(
+                "no_match",
+                `No instruction breakpoint at ${args.address}.`,
+                { address: args.address },
+            );
+        }
+
+        const normalized = args.address.replace(/^0x/i, '');
+        const display = '0x' + normalized.toUpperCase();
+        return {
+            text: `Address breakpoint removed at ${display}.`,
+            structuredContent: { address: display },
+        };
+    }
+
+    public async handleListProcesses(args: ListProcessesArgs): Promise<HandlerResponse> {
+        try {
+            let processes = enumerateProcesses();
+            if (args.filter) {
+                const lower = args.filter.toLowerCase();
+                processes = processes.filter((p) => p.name.toLowerCase().includes(lower));
+            }
+            const textOut = processes.length === 0
+                ? 'No matching processes found.'
+                : processes.map((p) => `${p.pid}\t${p.name}`).join('\n');
+            return { text: textOut, structuredContent: { processes } };
+        } catch (error) {
+            return handlerError(
+                "debug_adapter_error",
+                `Failed to enumerate processes: ${error}`,
+                { cause: String(error) },
+            );
+        }
+    }
+
     public async handleListBreakpoints(): Promise<HandlerResponse> {
         const breakpoints = this.executor.getBreakpoints();
-        if (breakpoints.length === 0) {
+        const instrBps = this.executor.getInstructionBreakpoints();
+
+        if (breakpoints.length === 0 && instrBps.size === 0) {
             return {
                 text: 'No breakpoints currently set',
-                structuredContent: { breakpoints: [] },
+                structuredContent: { breakpoints: [], addressBreakpoints: [] },
             };
         }
 
         const structured: Array<Record<string, unknown>> = [];
+        const addressStructured: Array<Record<string, unknown>> = [];
         let textOut = 'Active Breakpoints:\n';
-        breakpoints.forEach((bp, index) => {
+        let idx = 1;
+
+        breakpoints.forEach((bp) => {
             if (bp instanceof vscode.SourceBreakpoint) {
                 const fileName = path.basename(bp.location.uri.fsPath);
                 const line = bp.location.range.start.line + 1;
-                textOut += `${index + 1}. ${fileName}:${line}\n`;
+                textOut += `${idx++}. ${fileName}:${line}\n`;
                 structured.push(this.sourceBreakpointToSummary(bp, { includeModifiers: true }));
             } else if (bp instanceof vscode.FunctionBreakpoint) {
-                textOut += `${index + 1}. Function: ${bp.functionName}\n`;
+                textOut += `${idx++}. Function: ${bp.functionName}\n`;
                 structured.push({ functionName: bp.functionName });
             }
         });
 
-        return { text: textOut, structuredContent: { breakpoints: structured } };
+        for (const entry of instrBps.values()) {
+            textOut += `${idx++}. Address: ${entry.address}\n`;
+            const item: Record<string, unknown> = { address: entry.address };
+            if (entry.condition) item.condition = entry.condition;
+            if (entry.hitCondition) item.hitCondition = entry.hitCondition;
+            if (entry.logMessage) item.logMessage = entry.logMessage;
+            addressStructured.push(item);
+        }
+
+        return { text: textOut, structuredContent: { breakpoints: structured, addressBreakpoints: addressStructured } };
     }
 
     public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<HandlerResponse> {
