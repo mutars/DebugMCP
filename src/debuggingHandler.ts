@@ -7,6 +7,9 @@ import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { buildCppvsdbgConfig, buildCppvsdbgAttachConfig, StartDebuggingArgs, AttachDebuggingArgs } from './utils/cppvsdbgConfig';
+import { buildProsperoLaunchConfig, buildProsperoAttachConfig, ProsperoLaunchArgs, ProsperoElfPathFormat } from './utils/prosperoConfig';
+import { isPs5Available, listKitProcessesRaw } from './utils/ps5';
+import { getExitSince } from './utils/sessionExitTracker';
 import { classifySessionState, gateErrorFor, handlerError, requireNoActiveSession } from './utils/sessionGate';
 import { enumerateProcesses, findProcessByName } from './utils/processEnum';
 
@@ -40,18 +43,42 @@ export interface AddressBreakpointArgs {
 }
 
 export interface AttachToProcessArgs {
-    processId?: number;
+    processId?: number | string;
     processName?: string;
+    location?: 'local' | 'remote';
+    target?: string;
     extraConfig?: Record<string, unknown>;
     waitForBreakpointSeconds?: number;
+}
+
+// Unified launch request: cppvsdbg (default, local) and prospero (PS5 kit) fields.
+// The `debugger` discriminator selects the config builder; fields for the other
+// adapter are ignored.
+export interface StartDebuggingRequest extends Partial<StartDebuggingArgs> {
+    debugger?: 'cppvsdbg' | 'prospero';
+    elfPath?: string;
+    elfPathFormat?: ProsperoElfPathFormat;
+    target?: string;
+    workingDirectory?: string;
+    stopOnEntry?: boolean;
+    extraLaunchOptions?: Record<string, unknown>;
 }
 
 export interface ListProcessesArgs {
     filter?: string;
 }
 
+// Outcome of waiting for a launch/attach to settle. `exited` means the debuggee
+// ran to completion without ever pausing (no breakpoint, no fault) — a real run,
+// not a failure to attach.
+type SessionOutcome =
+    | { kind: 'paused' }
+    | { kind: 'attached' }
+    | { kind: 'never-attached' }
+    | { kind: 'exited'; exitCode: number | undefined };
+
 export interface IDebuggingHandler {
-    handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse>;
+    handleStartDebugging(args: StartDebuggingRequest): Promise<HandlerResponse>;
     handleAttachToProcess(args: AttachToProcessArgs): Promise<HandlerResponse>;
     handleStopDebugging(args?: { terminate?: boolean }): Promise<HandlerResponse>;
     handlePause(): Promise<HandlerResponse>;
@@ -71,6 +98,8 @@ export interface IDebuggingHandler {
     handleEvaluateExpression(args: { expression: string }): Promise<HandlerResponse>;
     handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse>;
     handleGetDebugState(): Promise<HandlerResponse>;
+    handleGetExceptionInfo(): Promise<HandlerResponse>;
+    handleListKitProcesses(args: { target?: string }): Promise<HandlerResponse>;
 }
 
 export class DebuggingHandler implements IDebuggingHandler {
@@ -78,6 +107,8 @@ export class DebuggingHandler implements IDebuggingHandler {
     private readonly executionDelay: number = 300;
     private readonly timeoutInSeconds: number;
     private static readonly DEFAULT_ATTACH_TIMEOUT_SECONDS = 30;
+    // PS5 kit launch (deploy + spawn over the network) is slower than a local .exe.
+    private static readonly DEFAULT_PROSPERO_TIMEOUT_SECONDS = 90;
 
     constructor(
         private readonly executor: IDebuggingExecutor,
@@ -117,7 +148,7 @@ export class DebuggingHandler implements IDebuggingHandler {
         return base;
     }
 
-    public async handleStartDebugging(args: StartDebuggingArgs): Promise<HandlerResponse> {
+    public async handleStartDebugging(args: StartDebuggingRequest): Promise<HandlerResponse> {
         const sessionGuard = requireNoActiveSession(this.executor);
         if (sessionGuard) return sessionGuard;
 
@@ -127,22 +158,46 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
         const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-        const config = buildCppvsdbgConfig(args, workspaceRoot);
-        const timeoutSeconds =
-            args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        // Adapter routing: cppvsdbg (default, local Windows) vs prospero (PS5 kit).
+        // Only the config build, pre-flight target, and default timeout differ; the
+        // launch / attach-wait / outcome handling below is debugger-agnostic.
+        let config: vscode.DebugConfiguration;
+        let preflightPath: string | undefined;
+        let defaultTimeout: number;
+        if (args.debugger === 'prospero') {
+            if (!isPs5Available()) {
+                return handlerError("bad_input", "debugger='prospero' requested but the PlayStation 5 SDK debug server was not found (set SCE_ROOT_DIR).");
+            }
+            if (!args.elfPath) {
+                return handlerError("bad_input", "debugger='prospero' requires 'elfPath'.");
+            }
+            config = buildProsperoLaunchConfig(args as ProsperoLaunchArgs) as unknown as vscode.DebugConfiguration;
+            // Only a local host ELF path is checkable on disk; workspace/package paths live on the kit.
+            preflightPath = (args.elfPathFormat ?? 'local') === 'local' ? args.elfPath : undefined;
+            defaultTimeout = DebuggingHandler.DEFAULT_PROSPERO_TIMEOUT_SECONDS;
+        } else {
+            if (!args.program) {
+                return handlerError("bad_input", "start_debugging requires 'program' (the .exe path) for the cppvsdbg debugger.");
+            }
+            config = buildCppvsdbgConfig(args as StartDebuggingArgs, workspaceRoot);
+            preflightPath = args.program;
+            defaultTimeout = DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        }
+
+        const timeoutSeconds = args.waitForBreakpointSeconds ?? defaultTimeout;
         const timeoutMs = timeoutSeconds * 1000;
 
-        // Pre-flight: catch the common typo case before the debugger hangs.
+        // Pre-flight: catch the missing-binary case before the debugger hangs.
         // Skip when the path contains a variable reference — those are resolved
         // later by VS Code's variable substitution layer.
-        if (!args.program.includes('${')) {
+        if (preflightPath && !preflightPath.includes('${')) {
             try {
-                await fs.promises.access(args.program, fs.constants.F_OK);
+                await fs.promises.access(preflightPath, fs.constants.F_OK);
             } catch {
                 return handlerError(
                     "bad_input",
-                    `Program not found: ${args.program}`,
-                    { program: args.program },
+                    `Program not found: ${preflightPath}`,
+                    { program: preflightPath },
                 );
             }
         }
@@ -150,7 +205,8 @@ export class DebuggingHandler implements IDebuggingHandler {
         // One shared deadline for the whole launch+attach+first-break cycle,
         // so the launch race and waitForSessionOutcome don't each consume the
         // full waitForBreakpointSeconds budget.
-        const deadline = Date.now() + timeoutMs;
+        const launchStartMs = Date.now();
+        const deadline = launchStartMs + timeoutMs;
 
         // Race startDebugging against the deadline — headless VS Code can hang
         // on non-launchable configs that pre-flight can't detect (e.g. a file
@@ -183,14 +239,20 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
 
         const remainingMs = Math.max(0, deadline - Date.now());
-        const outcome = await this.waitForSessionOutcome(remainingMs);
+        const outcome = await this.waitForSessionOutcome(remainingMs, launchStartMs);
 
-        switch (outcome) {
+        switch (outcome.kind) {
             case 'paused': {
                 const state = await this.executor.getCurrentDebugState(this.numNextLines);
                 return {
                     text: `Paused at ${state.fileName}:${state.currentLine} in ${state.frameName ?? '<unknown>'}.`,
                     structuredContent: state.toJSON(),
+                };
+            }
+            case 'exited': {
+                return {
+                    text: `Launched; ran to completion and exited with code ${outcome.exitCode ?? '<unknown>'}.`,
+                    structuredContent: { outcome: 'exited', exitCode: outcome.exitCode ?? null },
                 };
             }
             case 'attached': {
@@ -219,42 +281,65 @@ export class DebuggingHandler implements IDebuggingHandler {
         const sessionGuard = requireNoActiveSession(this.executor);
         if (sessionGuard) return sessionGuard;
 
-        if (args.processId === undefined && args.processName === undefined) {
-            return handlerError("bad_input", "Provide either processId or processName.");
-        }
-
-        let pid: number;
-        if (args.processId !== undefined) {
-            pid = args.processId;
-        } else {
-            const matches = findProcessByName(args.processName!);
-            if (matches.length === 0) {
-                return handlerError("bad_input", `No process found matching "${args.processName}".`);
-            }
-            if (matches.length > 1) {
-                return handlerError(
-                    "bad_input",
-                    `Multiple processes match "${args.processName}": ${matches.map((p) => `${p.name} (PID ${p.pid})`).join(', ')}. Specify processId instead.`,
-                    { matches },
-                );
-            }
-            pid = matches[0].pid;
-        }
-
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             return handlerError("no_workspace", "No workspace folder open.");
         }
         const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-        const config = buildCppvsdbgAttachConfig({
-            processId: pid,
-            extraConfig: args.extraConfig,
-        });
-        const timeoutSeconds =
-            args.waitForBreakpointSeconds ?? DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        // Adapter routing: local cppvsdbg (Windows PID, enumerated here) vs remote
+        // prospero (a kit-side PID string, taken as-is — no local enumeration).
+        let config: vscode.DebugConfiguration;
+        let pidLabel: string;
+        let defaultTimeout: number;
+        if (args.location === 'remote') {
+            if (!isPs5Available()) {
+                return handlerError("bad_input", "location='remote' requested but the PlayStation 5 SDK debug server was not found (set SCE_ROOT_DIR).");
+            }
+            if (args.processId === undefined) {
+                return handlerError("bad_input", "Remote attach requires 'processId' (the kit-side PID, e.g. from list_kit_processes).");
+            }
+            const kitPid = String(args.processId);
+            config = buildProsperoAttachConfig({
+                processId: kitPid,
+                target: args.target,
+                extraAttachOptions: args.extraConfig,
+            }) as unknown as vscode.DebugConfiguration;
+            pidLabel = kitPid;
+            defaultTimeout = DebuggingHandler.DEFAULT_PROSPERO_TIMEOUT_SECONDS;
+        } else {
+            if (args.processId === undefined && args.processName === undefined) {
+                return handlerError("bad_input", "Provide either processId or processName.");
+            }
+            let pid: number;
+            if (args.processId !== undefined) {
+                pid = typeof args.processId === 'string' ? parseInt(args.processId, 10) : args.processId;
+            } else {
+                const matches = findProcessByName(args.processName!);
+                if (matches.length === 0) {
+                    return handlerError("bad_input", `No process found matching "${args.processName}".`);
+                }
+                if (matches.length > 1) {
+                    return handlerError(
+                        "bad_input",
+                        `Multiple processes match "${args.processName}": ${matches.map((p) => `${p.name} (PID ${p.pid})`).join(', ')}. Specify processId instead.`,
+                        { matches },
+                    );
+                }
+                pid = matches[0].pid;
+            }
+            config = buildCppvsdbgAttachConfig({
+                processId: pid,
+                extraConfig: args.extraConfig,
+            });
+            pidLabel = String(pid);
+            defaultTimeout = DebuggingHandler.DEFAULT_ATTACH_TIMEOUT_SECONDS;
+        }
+
+        const timeoutSeconds = args.waitForBreakpointSeconds ?? defaultTimeout;
         const timeoutMs = timeoutSeconds * 1000;
-        const deadline = Date.now() + timeoutMs;
+        const launchStartMs = Date.now();
+        const deadline = launchStartMs + timeoutMs;
 
         let launchTimer: ReturnType<typeof setTimeout> | undefined;
         const launchTimeout = new Promise<'timeout'>((resolve) => {
@@ -269,39 +354,45 @@ export class DebuggingHandler implements IDebuggingHandler {
         if (launchTimer) clearTimeout(launchTimer);
 
         if (launchResult === 'rejected') {
-            return handlerError("launch_rejected", `Failed to attach to PID ${pid}.`);
+            return handlerError("launch_rejected", `Failed to attach to PID ${pidLabel}.`);
         }
         if (launchResult === 'timeout') {
             this.executor.stopDebugging().catch(() => undefined);
             return handlerError(
                 "attach_failed",
-                `Attach to PID ${pid} did not complete within ${timeoutSeconds}s.`,
-                { timeoutSeconds, processId: pid },
+                `Attach to PID ${pidLabel} did not complete within ${timeoutSeconds}s.`,
+                { timeoutSeconds, processId: pidLabel },
             );
         }
 
         const remainingMs = Math.max(0, deadline - Date.now());
-        const outcome = await this.waitForSessionOutcome(remainingMs);
+        const outcome = await this.waitForSessionOutcome(remainingMs, launchStartMs);
 
-        switch (outcome) {
+        switch (outcome.kind) {
             case 'paused': {
                 const state = await this.executor.getCurrentDebugState(this.numNextLines);
                 return {
-                    text: `Attached to PID ${pid}, paused at ${state.fileName}:${state.currentLine}.`,
+                    text: `Attached to PID ${pidLabel}, paused at ${state.fileName}:${state.currentLine}.`,
                     structuredContent: state.toJSON(),
+                };
+            }
+            case 'exited': {
+                return {
+                    text: `Attached to PID ${pidLabel}; the process exited with code ${outcome.exitCode ?? '<unknown>'}.`,
+                    structuredContent: { outcome: 'exited', processId: pidLabel, exitCode: outcome.exitCode ?? null },
                 };
             }
             case 'attached': {
                 return {
-                    text: `Attached to PID ${pid}; running. Use add_breakpoint or add_address_breakpoint then continue_execution to pause.`,
-                    structuredContent: { outcome: 'running', processId: pid },
+                    text: `Attached to PID ${pidLabel}; running. Use add_breakpoint or add_address_breakpoint then continue_execution to pause.`,
+                    structuredContent: { outcome: 'running', processId: pidLabel },
                 };
             }
             case 'never-attached':
                 return handlerError(
                     "attach_failed",
-                    `Debug session never attached to PID ${pid} within ${timeoutSeconds}s.`,
-                    { timeoutSeconds, processId: pid },
+                    `Debug session never attached to PID ${pidLabel} within ${timeoutSeconds}s.`,
+                    { timeoutSeconds, processId: pidLabel },
                 );
         }
     }
@@ -692,6 +783,54 @@ export class DebuggingHandler implements IDebuggingHandler {
         return this.stateToEnvelope(state);
     }
 
+    public async handleGetExceptionInfo(): Promise<HandlerResponse> {
+        const session = this.executor.getActiveSession();
+        if (!session) {
+            return handlerError("no_session", "No active debug session.");
+        }
+        const activeStackItem = vscode.debug.activeStackItem;
+        const threadId = activeStackItem && 'threadId' in activeStackItem
+            ? activeStackItem.threadId
+            : undefined;
+        if (threadId === undefined) {
+            return gateErrorFor('not_paused');
+        }
+        try {
+            // DAP exceptionInfo → { exceptionId, description?, breakMode, details? }.
+            // For a PS5 SIGSEGV this carries the signal + faulting address / access type.
+            const info = await session.customRequest('exceptionInfo', { threadId });
+            const detailMsg = info?.details?.message ? `\n${info.details.message}` : '';
+            const text = `Exception: ${info?.exceptionId ?? '<unknown>'}` +
+                (info?.description ? ` — ${info.description}` : '') + detailMsg;
+            return { text, structuredContent: info ?? {} };
+        } catch (error) {
+            return handlerError(
+                "debug_adapter_error",
+                `exceptionInfo request failed (the adapter may not support it, or the stop was not an exception): ${error}`,
+                { cause: String(error) },
+            );
+        }
+    }
+
+    public async handleListKitProcesses(args: { target?: string }): Promise<HandlerResponse> {
+        if (!isPs5Available()) {
+            return handlerError("bad_input", "PlayStation 5 SDK not found (set SCE_ROOT_DIR); list_kit_processes is unavailable.");
+        }
+        try {
+            const raw = listKitProcessesRaw(args.target);
+            return {
+                text: raw.trim() || '(no processes reported)',
+                structuredContent: { raw, target: args.target ?? null },
+            };
+        } catch (error) {
+            return handlerError(
+                "debug_adapter_error",
+                `prospero-ctrl process list failed: ${error}`,
+                { cause: String(error) },
+            );
+        }
+    }
+
     public async handleGetProgramOutput(args: { tail?: number }): Promise<HandlerResponse> {
         const buffer = this.executor.getOutputBuffer();
         if (!buffer) {
@@ -713,7 +852,8 @@ export class DebuggingHandler implements IDebuggingHandler {
 
     private async waitForSessionOutcome(
         timeoutMs: number,
-    ): Promise<'paused' | 'attached' | 'never-attached'> {
+        launchStartMs: number,
+    ): Promise<SessionOutcome> {
         const baseDelay = 1000;
         const maxDelay = 10000;
         const startTime = Date.now();
@@ -722,7 +862,17 @@ export class DebuggingHandler implements IDebuggingHandler {
         while (Date.now() - startTime < timeoutMs) {
             if (await this.executor.hasActiveSession()) {
                 logger.info('Debug session reached paused state.');
-                return 'paused';
+                return { kind: 'paused' };
+            }
+            // No paused session and nothing attached → the debuggee may have run to
+            // completion without pausing. Report its exit code rather than a misleading
+            // "never attached".
+            if (!this.executor.hasAttachedSession()) {
+                const exit = getExitSince(launchStartMs);
+                if (exit) {
+                    logger.info(`Debug session exited with code ${exit.exitCode}.`);
+                    return { kind: 'exited', exitCode: exit.exitCode };
+                }
             }
             const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
             const jitteredDelay = delay + Math.random() * 200;
@@ -730,7 +880,9 @@ export class DebuggingHandler implements IDebuggingHandler {
             attempt++;
         }
 
-        return this.executor.hasAttachedSession() ? 'attached' : 'never-attached';
+        const exit = getExitSince(launchStartMs);
+        if (exit) return { kind: 'exited', exitCode: exit.exitCode };
+        return this.executor.hasAttachedSession() ? { kind: 'attached' } : { kind: 'never-attached' };
     }
 
     private async waitForStateChange(beforeState: DebugState): Promise<DebugState> {

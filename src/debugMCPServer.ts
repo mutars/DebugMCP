@@ -14,6 +14,7 @@ import { HandlerResponse } from './debuggingHandler';
 import { OutputRingBuffer } from './utils/outputRingBuffer';
 import { logger } from './utils/logger';
 import { LifecycleGuard } from './utils/lifecycleGuard';
+import { isPs5Available } from './utils/ps5';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -108,6 +109,8 @@ export class DebugMCPServer {
     private setupTools() {
         const REQUIRES_PAUSED = 'Requires a paused session (otherwise `isError` with `reason="no_session"` or `"not_paused"`).';
         const REQUIRES_ACTIVE = 'Requires an active session (otherwise `isError` with `reason="no_session"`).';
+        // PS5 SDK presence — gates the PS5-only tools (e.g. list_kit_processes).
+        const ps5Available = isPs5Available();
 
         this.mcpServer!.registerTool('get_debug_instructions', {
             description: 'Return the DebugMCP debugging guide: breakpoint strategies, root-cause framework, best practices.',
@@ -119,13 +122,14 @@ export class DebugMCPServer {
         this.mcpServer!.registerTool('start_debugging', {
             description:
                 'Launch a C++ executable under the cppvsdbg debugger. Builds a launch config from the fields below (no launch.json is read); `type` is always `cppvsdbg`, `request` always `launch`. ' +
-                'Outcomes: success returns either a paused DebugState (at a breakpoint or entry) or `structuredContent.outcome="running"` when attached without hitting a breakpoint; failure returns `isError` with `reason` in `{bad_input, launch_rejected, attach_failed, no_workspace, session_active}`. ' +
+                'Outcomes: success returns a paused DebugState (at a breakpoint/entry), `structuredContent.outcome="exited"` with `exitCode` when the program ran to completion without pausing, or `structuredContent.outcome="running"` when attached but neither paused nor exited within the budget; failure returns `isError` with `reason` in `{bad_input, launch_rejected, attach_failed, no_workspace, session_active}`. ' +
                 'While a session is active, a second call returns `isError` with `reason="session_active"` — call `stop_debugging` first. Always call `stop_debugging` when your debug investigation is complete; sessions left idle for 10 minutes are auto-stopped. ' +
-                'Every outcome resolves within `waitForBreakpointSeconds`.',
+                'Every outcome resolves within `waitForBreakpointSeconds`. ' +
+                'Set `debugger:"prospero"` to launch a PlayStation 5 ELF on the devkit instead (PS5 SDK required) — use `elfPath`/`target`/`elfPathFormat`/`stopOnEntry` in place of `program`/`cwd`/`console`.',
             inputSchema: {
-                program: z.string().describe(
-                    "Absolute path to the .exe, or a path using ${workspaceFolder}. " +
-                    "Concrete paths must exist on disk — missing paths return `bad_input` immediately. Required."
+                program: z.string().optional().describe(
+                    "cppvsdbg only. Absolute path to the .exe, or a path using ${workspaceFolder}. " +
+                    "Concrete paths must exist on disk — missing paths return `bad_input` immediately. Required for the default (cppvsdbg) debugger."
                 ),
                 args: z.array(z.string()).optional().describe(
                     "Program arguments, one argv token per array element (no shell splitting)."
@@ -152,7 +156,29 @@ export class DebugMCPServer {
                     "Budget for the whole launch + attach + first-break cycle. " +
                     "If no breakpoint or entry-stop is hit within the budget, returns `outcome=\"running\"`. " +
                     "If the debugger never attaches, returns `isError` with `reason=\"attach_failed\"`. " +
-                    "Defaults to 30."
+                    "Defaults to 30 (cppvsdbg) / 90 (prospero / PS5)."
+                ),
+                debugger: z.enum(["cppvsdbg", "prospero"]).optional().describe(
+                    "Debug adapter. 'cppvsdbg' (default) launches a local Windows .exe via `program`. " +
+                    "'prospero' launches a PlayStation 5 ELF on the devkit via `elfPath` (PS5 SDK required)."
+                ),
+                elfPath: z.string().optional().describe(
+                    "PS5 only. Path to the Debug ELF to launch (host path when elfPathFormat='local'). Required when debugger='prospero'."
+                ),
+                elfPathFormat: z.enum(["local", "workspace", "package"]).optional().describe(
+                    "PS5 only. How elfPath is interpreted: 'local' (host path, default), 'workspace', or 'package'."
+                ),
+                target: z.string().optional().describe(
+                    "PS5 only. Kit name / hostname / IP. Omit to use the SDK default target."
+                ),
+                workingDirectory: z.string().optional().describe(
+                    "PS5 only. Working Directory (/app0/) override for the launched ELF."
+                ),
+                stopOnEntry: z.boolean().optional().describe(
+                    "PS5 only. Break at the program entry point before anything runs."
+                ),
+                extraLaunchOptions: z.record(z.unknown()).optional().describe(
+                    "PS5 only. Additional prospero launchOptions (gp5File, app, saveDataRootDirectory, ...). Explicit fields win."
                 ),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleStartDebugging(args)));
@@ -235,6 +261,12 @@ export class DebugMCPServer {
             description: `Return the paused-state snapshot: file, line, frame, stack, active breakpoints. ${REQUIRES_PAUSED}`,
         }, this.delegate(() => this.debuggingHandler.handleGetDebugState()));
 
+        this.mcpServer!.registerTool('get_exception_info', {
+            description:
+                `Return exception/fault detail for the current stop (DAP exceptionInfo): for a crash this is the signal/exception id, description, and faulting address/access type. ${REQUIRES_PAUSED} ` +
+                `Errors with reason="debug_adapter_error" if the stop was not an exception or the adapter does not implement exceptionInfo.`,
+        }, this.delegate(() => this.debuggingHandler.handleGetExceptionInfo()));
+
         this.mcpServer!.registerTool('get_program_output', {
             description: 'Read captured stdout/stderr from the program under debug. Buffer resets on each start_debugging.',
             inputSchema: {
@@ -253,21 +285,28 @@ export class DebugMCPServer {
 
         this.mcpServer!.registerTool('attach_to_process', {
             description:
-                'Attach the cppvsdbg debugger to a running process. Provide either `processId` (PID) or `processName` (resolved to PID). ' +
+                'Attach the debugger to a running process. Default (`location:"local"`) attaches cppvsdbg to a local Windows process by `processId` or `processName`. ' +
+                'Set `location:"remote"` to attach the PlayStation 5 (prospero) debugger to a kit process by `processId` (the kit-side PID from `list_kit_processes`) and optional `target` (PS5 SDK required). ' +
                 'Outcomes mirror `start_debugging`: success returns a paused DebugState or `outcome="running"`; failure returns `isError` with `reason`. ' +
                 'While a session is active, returns `reason="session_active"` — call `stop_debugging` first.',
             inputSchema: {
-                processId: z.number().int().positive().optional().describe(
-                    'PID of the process to attach to. One of processId or processName is required.',
+                processId: z.union([z.number().int().positive(), z.string()]).optional().describe(
+                    'PID to attach to: a number for a local Windows PID, or a string for a kit-side PID when location="remote". One of processId or processName is required (processName is local-only).',
                 ),
                 processName: z.string().optional().describe(
-                    'Name of the process (e.g., "FlatOut.exe"). Resolved to PID; fails if multiple processes match.',
+                    'Local only. Name of the process (e.g., "FlatOut.exe"). Resolved to PID; fails if multiple processes match.',
+                ),
+                location: z.enum(["local", "remote"]).optional().describe(
+                    "'local' (default) attaches cppvsdbg to a Windows process. 'remote' attaches the PS5 (prospero) debugger to a kit process.",
+                ),
+                target: z.string().optional().describe(
+                    'Remote (PS5) only. Kit name / hostname / IP. Omit to use the SDK default target.',
                 ),
                 extraConfig: z.record(z.unknown()).optional().describe(
-                    'Additional cppvsdbg fields merged into the attach config.',
+                    'Additional adapter-specific fields merged into the attach config.',
                 ),
                 waitForBreakpointSeconds: z.number().int().positive().optional().describe(
-                    'Timeout for the attach cycle. Defaults to 30.',
+                    'Timeout for the attach cycle. Defaults to 30 (local) / 90 (remote PS5).',
                 ),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleAttachToProcess(args)));
@@ -302,6 +341,22 @@ export class DebugMCPServer {
                 ),
             },
         }, this.delegate((args: any) => this.debuggingHandler.handleListProcesses(args)));
+
+        // PS5-only tools — registered only when the PlayStation 5 SDK is present,
+        // so on a non-SDK machine the PS5 surface simply does not appear.
+        if (ps5Available) {
+            this.mcpServer!.registerTool('list_kit_processes', {
+                description:
+                    'List processes running on the PlayStation 5 devkit (via `prospero-ctrl process list`). ' +
+                    'Use to find a kit-side PID for `attach_to_process { location:"remote", processId }`. ' +
+                    'Returns the raw process table as text. PS5-only; present only when the PS5 SDK is installed.',
+                inputSchema: {
+                    target: z.string().optional().describe(
+                        'Kit name / hostname / IP. Omit to use the SDK default target.',
+                    ),
+                },
+            }, this.delegate((args: any) => this.debuggingHandler.handleListKitProcesses(args)));
+        }
     }
 
     /**

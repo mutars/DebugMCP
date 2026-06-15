@@ -7,6 +7,7 @@ import { logger, LogLevel } from './utils/logger';
 import { resolvePort } from './utils/portResolver';
 import { OutputRingBuffer } from './utils/outputRingBuffer';
 import { registerOutputTracker, OUTPUT_BUFFER_CAPACITY } from './utils/debugOutputTracker';
+import { registerSessionExitTracker } from './utils/sessionExitTracker';
 
 let mcpServer: DebugMCPServer | null = null;
 let agentConfigManager: AgentConfigurationManager | null = null;
@@ -34,6 +35,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const outputBuffer = new OutputRingBuffer(OUTPUT_BUFFER_CAPACITY);
     registerOutputTracker(context, outputBuffer);
+    registerSessionExitTracker(context);
 
     // Migrate existing SSE configurations to streamableHttp (for backward compatibility)
     if (!headless) {
@@ -66,6 +68,26 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register commands
     registerCommands(context);
+
+    // Diagnostic DAP tracer (opt-in via DEBUGMCP_DAP_TRACE): logs the full DAP
+    // request/response/event/error/exit stream for every debug session, so a
+    // headless launch that fails silently (e.g. a prospero adapter rejecting a
+    // request) can be traced from the extension log.
+    if (process.env.DEBUGMCP_DAP_TRACE) {
+        context.subscriptions.push(vscode.debug.registerDebugAdapterTrackerFactory('*', {
+            createDebugAdapterTracker(session: vscode.DebugSession) {
+                const tag = `${session.type}/${session.id.slice(0, 6)}`;
+                return {
+                    onWillStartSession: () => logger.info(`[DAP ${tag}] start`),
+                    onWillReceiveMessage: (m: any) => logger.info(`[DAP ${tag} ->adapter] ${JSON.stringify(m).slice(0, 3000)}`),
+                    onDidSendMessage: (m: any) => logger.info(`[DAP ${tag} adapter->] ${JSON.stringify(m).slice(0, 3000)}`),
+                    onError: (e: Error) => logger.error(`[DAP ${tag} ERROR] ${e?.stack ?? e}`),
+                    onExit: (code: number | undefined, signal: string | undefined) => logger.info(`[DAP ${tag} EXIT] code=${code} signal=${signal}`),
+                };
+            },
+        }));
+        logger.info('DAP trace enabled (DEBUGMCP_DAP_TRACE)');
+    }
 
     // Show post-install popup if needed (with slight delay to allow VS Code to fully load)
     if (!headless) {
