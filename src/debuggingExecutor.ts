@@ -17,6 +17,22 @@ export interface InstructionBreakpointEntry {
     logMessage?: string;
 }
 
+interface DapThread {
+    id?: number;
+    name?: string;
+}
+
+interface DapStackFrame {
+    id?: number;
+    name?: string;
+    source?: {
+        name?: string;
+        path?: string;
+    };
+    line?: number;
+    column?: number;
+}
+
 /**
  * Interface for debugging execution operations
  */
@@ -109,10 +125,40 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Pause (break all) the running debuggee
      */
     public async pause(): Promise<void> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+
+        const dapErrors: string[] = [];
+        try {
+            const threadsResponse = await session.customRequest('threads');
+            const threads = Array.isArray(threadsResponse?.threads)
+                ? threadsResponse.threads as DapThread[]
+                : [];
+
+            for (const thread of threads) {
+                if (typeof thread.id !== 'number') {
+                    continue;
+                }
+                try {
+                    await session.customRequest('pause', { threadId: thread.id });
+                    return;
+                } catch (error) {
+                    dapErrors.push(`thread ${thread.id}: ${error}`);
+                }
+            }
+        } catch (error) {
+            dapErrors.push(`threads: ${error}`);
+        }
+
+        // Fallback for adapters that do not expose DAP pause cleanly. The handler
+        // validates the resulting stopped state separately.
         try {
             await vscode.commands.executeCommand('workbench.action.debug.pause');
         } catch (error) {
-            throw new Error(`Failed to pause: ${error}`);
+            const detail = dapErrors.length > 0 ? ` DAP errors: ${dapErrors.join('; ')}` : '';
+            throw new Error(`Failed to pause: ${error}.${detail}`);
         }
     }
 
@@ -231,12 +277,11 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 if (activeStackItem && 'frameId' in activeStackItem) {
                     state.updateContext(activeStackItem.frameId, activeStackItem.threadId);
                     
-                    // Extract frame name from stack frame
-                    await this.extractFrameName(activeSession, activeStackItem.frameId, state);
+                    const currentFrame = await this.extractStackInfo(activeSession, state);
                     
                     // Get the active editor
                     const activeEditor = vscode.window.activeTextEditor;
-                    if (activeEditor) {
+                    if (activeEditor && this.editorMatchesFrame(activeEditor, currentFrame)) {
                         const fileName = activeEditor.document.fileName.split(/[/\\]/).pop() || '';
                         const currentLine = activeEditor.selection.active.line + 1; // 1-based line number
                         const currentLineContent = activeEditor.document.lineAt(activeEditor.selection.active.line).text.trim();
@@ -260,7 +305,11 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                             currentLineContent,
                             nextLines
                         );
+                    } else {
+                        await this.updateLocationFromStackFrame(currentFrame, state, numNextLines);
                     }
+                } else {
+                    await this.extractFirstStoppedThreadState(activeSession, state, numNextLines);
                 }
             }
         } catch (error) {
@@ -281,10 +330,92 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         return state;
     }
 
+    private editorMatchesFrame(editor: vscode.TextEditor, frame: DapStackFrame | null): boolean {
+        const framePath = frame?.source?.path;
+        if (!framePath) {
+            return true;
+        }
+        return editor.document.fileName.toLowerCase() === framePath.toLowerCase();
+    }
+
+    private async updateLocationFromStackFrame(
+        frame: DapStackFrame | null,
+        state: DebugState,
+        numNextLines: number,
+    ): Promise<void> {
+        if (!frame || typeof frame.line !== 'number') {
+            return;
+        }
+
+        const sourcePath = frame.source?.path;
+        const fileName = frame.source?.name ?? sourcePath?.split(/[/\\]/).pop();
+        if (!fileName) {
+            return;
+        }
+
+        let currentLineContent = '';
+        const nextLines: string[] = [];
+        if (sourcePath) {
+            try {
+                const document = await vscode.workspace.openTextDocument(vscode.Uri.file(sourcePath));
+                const lineIndex = frame.line - 1;
+                if (lineIndex >= 0 && lineIndex < document.lineCount) {
+                    currentLineContent = document.lineAt(lineIndex).text.trim();
+                    let lineOffset = 1;
+                    while (nextLines.length < numNextLines && lineIndex + lineOffset < document.lineCount) {
+                        const lineText = document.lineAt(lineIndex + lineOffset).text.trim();
+                        if (lineText.length > 0) {
+                            nextLines.push(lineText);
+                        }
+                        lineOffset++;
+                    }
+                }
+            } catch (error) {
+                console.log('Unable to read frame source location:', error);
+            }
+        }
+
+        state.updateLocation(
+            sourcePath ?? fileName,
+            fileName,
+            frame.line,
+            currentLineContent,
+            nextLines,
+        );
+    }
+
+    private stackFramesToState(
+        stackFrames: DapStackFrame[],
+        threadId: number,
+        state: DebugState,
+    ): DapStackFrame | null {
+        if (stackFrames.length === 0) {
+            return null;
+        }
+
+        const currentFrame = stackFrames[0];
+        if (typeof currentFrame.id === 'number') {
+            state.updateContext(currentFrame.id, threadId);
+        }
+        state.updateFrameName(currentFrame.name || null);
+
+        const stackTrace: StackFrame[] = stackFrames.map((frame) => ({
+            name: frame.name || 'unknown',
+            source: frame.source?.path || frame.source?.name || undefined,
+            line: frame.line || undefined,
+            column: frame.column || undefined,
+        }));
+        state.updateStackTrace(stackTrace);
+        return currentFrame;
+    }
+
     /**
-     * Extract frame name and stack trace from the current debug session
+     * Extract frame name and stack trace from the current debug session.
      */
-    private async extractFrameName(session: vscode.DebugSession, frameId: number, state: DebugState): Promise<void> {
+    private async extractStackInfo(session: vscode.DebugSession, state: DebugState): Promise<DapStackFrame | null> {
+        if (state.threadId === null) {
+            return null;
+        }
         try {
             // Get full stack trace (up to 50 frames)
             const stackTraceResponse = await session.customRequest('stackTrace', {
@@ -294,25 +425,54 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             });
 
             if (stackTraceResponse?.stackFrames && stackTraceResponse.stackFrames.length > 0) {
-                // Extract frame name from current frame
-                const currentFrame = stackTraceResponse.stackFrames[0];
-                state.updateFrameName(currentFrame.name || null);
-
-                // Build stack trace array
-                const stackTrace: StackFrame[] = stackTraceResponse.stackFrames.map((frame: any) => ({
-                    name: frame.name || 'unknown',
-                    source: frame.source?.path || frame.source?.name || undefined,
-                    line: frame.line || undefined,
-                    column: frame.column || undefined,
-                }));
-
-                state.updateStackTrace(stackTrace);
+                return this.stackFramesToState(stackTraceResponse.stackFrames as DapStackFrame[], state.threadId, state);
             }
         } catch (error) {
             console.log('Unable to extract stack info:', error);
             // Set empty values on error
             state.updateFrameName(null);
             state.updateStackTrace([]);
+        }
+
+        return null;
+    }
+
+    private async extractFirstStoppedThreadState(
+        session: vscode.DebugSession,
+        state: DebugState,
+        numNextLines: number,
+    ): Promise<void> {
+        try {
+            const threadsResponse = await session.customRequest('threads');
+            const threads = Array.isArray(threadsResponse?.threads)
+                ? threadsResponse.threads as DapThread[]
+                : [];
+
+            for (const thread of threads) {
+                if (typeof thread.id !== 'number') {
+                    continue;
+                }
+                try {
+                    const stackTraceResponse = await session.customRequest('stackTrace', {
+                        threadId: thread.id,
+                        startFrame: 0,
+                        levels: 50
+                    });
+                    const stackFrames = Array.isArray(stackTraceResponse?.stackFrames)
+                        ? stackTraceResponse.stackFrames as DapStackFrame[]
+                        : [];
+                    const currentFrame = this.stackFramesToState(stackFrames, thread.id, state);
+                    if (currentFrame) {
+                        await this.updateLocationFromStackFrame(currentFrame, state, numNextLines);
+                        return;
+                    }
+                } catch {
+                    // Running threads usually reject stackTrace. Keep probing until
+                    // one stopped thread yields frames.
+                }
+            }
+        } catch (error) {
+            console.log('Unable to enumerate stopped thread state:', error);
         }
     }
 
@@ -458,13 +618,12 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         }
 
         try {
-            // Get the current debug state and check if it has location information
+            // Get the current debug state and check if it has stopped execution context.
             // This is the most reliable way to determine if the debugger is truly ready
             const debugState = await this.getCurrentDebugState();
             
-            // A session is ready when it has location info (file name and line number)
-            // This means the debugger has attached and we can see where we are in the code
-            return debugState.sessionActive && debugState.hasLocationInfo();
+            // Native debuggers can stop without source file/line information.
+            return debugState.isPaused();
         } catch (error) {
             // Any error means session isn't ready (e.g., Python still initializing)
             console.log('Session readiness check failed:', error);

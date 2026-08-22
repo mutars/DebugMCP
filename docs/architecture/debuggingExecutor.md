@@ -14,7 +14,7 @@ VS Code's debug API is powerful but requires careful handling. `DebuggingExecuto
 - Start and stop debug sessions
 - Manage breakpoints (add, remove, list, clear)
 - Retrieve current debug state (file, line, frame info)
-- Execute DAP custom requests for variables and expression evaluation
+- Execute DAP custom requests for pause, stack traces, variables, and expression evaluation
 - Determine if a debug session is ready for operations
 
 ## Architecture Position
@@ -40,12 +40,14 @@ VS Code's debug API is powerful but requires careful handling. `DebuggingExecuto
 
 ### VS Code Debug Commands
 
-Stepping and control operations use VS Code's command system:
+Stepping and most control operations use VS Code's command system:
 - `workbench.action.debug.stepOver`
 - `workbench.action.debug.stepInto`
 - `workbench.action.debug.stepOut`
 - `workbench.action.debug.continue`
 - `workbench.action.debug.restart`
+
+Pause is special: it first uses DAP `threads` + `pause` against the active debug session, then falls back to `workbench.action.debug.pause` for adapters that do not expose DAP pause cleanly.
 
 ### DAP Custom Requests
 
@@ -53,6 +55,8 @@ For data retrieval, the executor uses DAP's custom request mechanism:
 
 | Request | Purpose |
 |---------|---------|
+| `threads` | Enumerate thread IDs for pause and no-source stack probing |
+| `pause` | Interrupt a running thread/debuggee |
 | `stackTrace` | Get call stack and frame names |
 | `scopes` | Get variable scopes for a frame |
 | `variables` | Get variables within a scope |
@@ -62,9 +66,9 @@ For data retrieval, the executor uses DAP's custom request mechanism:
 
 A session is considered "ready" when:
 1. `vscode.debug.activeDebugSession` exists
-2. Location info is available (file name and line number)
+2. Stopped execution context is available (frame/thread IDs, source location, or stack frames)
 
-This handles cases where the debugger is still initializing (common with Python).
+This handles both source-level stops and native no-source stops such as system DLLs or disassembly frames.
 
 ### State Retrieval
 
@@ -72,7 +76,7 @@ This handles cases where the debugger is still initializing (common with Python)
 - `vscode.debug.activeDebugSession` - Session existence
 - `vscode.debug.activeStackItem` - Frame/thread context
 - `vscode.window.activeTextEditor` - Current file and line
-- DAP `stackTrace` request - Frame name
+- DAP `stackTrace` request - Frame name and fallback stopped-thread state
 
 ## Key Code Locations
 

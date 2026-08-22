@@ -78,6 +78,19 @@ export class DebugState {
     }
 
     /**
+     * Check if the debuggee is stopped and has inspectable execution state.
+     *
+     * Native debuggers can stop in frames with no source location, so paused
+     * state cannot require file/line information.
+     */
+    public isPaused(): boolean {
+        return this.sessionActive &&
+               (this.hasValidContext() ||
+                this.hasLocationInfo() ||
+                this.stackTrace.length > 0);
+    }
+
+    /**
      * Update the current execution context
      */
     public updateContext(frameId: number, threadId: number): void {
@@ -155,12 +168,14 @@ export class DebugState {
     }
 
     public toJSON(): Record<string, unknown> {
-        const paused = this.sessionActive && this.hasLocationInfo();
+        const paused = this.isPaused();
         const base: Record<string, unknown> = {
             sessionActive: this.sessionActive,
             paused,
         };
-        if (!paused) return base;
+        if (!paused) {
+            return base;
+        }
         base.configurationName = this.configurationName;
         base.stackTrace = this.stackTrace.map((f) => `${f.name}:${f.line ?? '?'}`);
         base.breakpoints = this.breakpoints;
@@ -176,12 +191,16 @@ export class DebugState {
     }
 
     public toString(): string {
-        const paused = this.sessionActive && this.hasLocationInfo();
+        const paused = this.isPaused();
         if (!paused) {
             return `Not paused (sessionActive=${this.sessionActive})`;
         }
         const lines: string[] = [];
-        lines.push(`Paused at ${this.fileName}:${this.currentLine} in ${this.frameName ?? '<unknown>'}`);
+        if (this.hasLocationInfo()) {
+            lines.push(`Paused at ${this.fileName}:${this.currentLine} in ${this.frameName ?? '<unknown>'}`);
+        } else {
+            lines.push(`Paused in ${this.frameName ?? '<unknown>'}`);
+        }
         if (this.nextLines.length > 0) {
             lines.push("Next:");
             const base = this.currentLine ?? 0;

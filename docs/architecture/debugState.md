@@ -36,6 +36,7 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 | `hasValidContext()` | Check if frame/thread IDs are set |
 | `hasLocationInfo()` | Check if file/line info is available |
 | `hasFrameName()` | Check if frame name is available |
+| `isPaused()` | Check if the session has stopped execution context, even without source location |
 | `clone()` | Create a deep copy for comparison |
 | `reset()` | Clear all state to initial values |
 | `updateContext()` | Set frame and thread IDs |
@@ -60,3 +61,4 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 - **Immutable by convention**: Use `clone()` when you need a snapshot
 - **Incremental building**: State is built via multiple update calls during retrieval
 - **Null-safe**: All optional fields default to null, with helper methods to check validity
+- **Native stops**: Paused state is based on execution context, not only file/line information, because C++ debuggers can stop in frames without source.

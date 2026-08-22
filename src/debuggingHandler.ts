@@ -464,8 +464,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 { operation: "pause", cause: String(error) },
             );
         }
-        await new Promise(resolve => setTimeout(resolve, this.executionDelay));
-        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        const state = await this.waitForPausedState(Math.min(this.timeoutInSeconds * 1000, 5000));
         return this.stateToEnvelope(state);
     }
 
@@ -848,6 +847,21 @@ export class DebuggingHandler implements IDebuggingHandler {
 
     public async isDebuggingActive(): Promise<boolean> {
         return await this.executor.hasActiveSession();
+    }
+
+    private async waitForPausedState(timeoutMs: number): Promise<DebugState> {
+        const pollMs = 100;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < timeoutMs) {
+            const state = await this.executor.getCurrentDebugState(this.numNextLines);
+            if (state.isPaused()) {
+                return state;
+            }
+            await new Promise((resolve) => setTimeout(resolve, pollMs));
+        }
+
+        return await this.executor.getCurrentDebugState(this.numNextLines);
     }
 
     private async waitForSessionOutcome(
